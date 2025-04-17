@@ -1,0 +1,6 @@
+google-generativeai
+weaviate-client
+pytest
+pytest-asyncio
+ruff
+watchdog
