@@ -1,5 +1,6 @@
 # Log files
 mcp_server.log
+pytest.log
 
 # Certificates
 certs/
@@ -26,6 +27,8 @@ venv.bak/
 
 # Pytest cache
 .pytest_cache/
+
+# Ruff cache
 .ruff_cache/
 
 # Build artifacts
