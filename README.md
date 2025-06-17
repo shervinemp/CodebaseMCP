@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/shervinemp-codebasemcp-badge.png)](https://mseep.ai/app/shervinemp-codebasemcp)
+
 # Python Codebase Analysis RAG System
 
 This system analyzes Python code using Abstract Syntax Trees (AST), stores the extracted information (functions, classes, calls, variables, etc.) in a Weaviate vector database, and provides tools for querying and understanding the codebase via a Model Context Protocol (MCP) server. It leverages Google's Gemini models for generating embeddings and natural language descriptions/answers.
