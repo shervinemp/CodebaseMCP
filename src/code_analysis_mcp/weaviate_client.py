@@ -18,14 +18,28 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 
-def create_weaviate_client():
-    logger.debug("Attempting to create Weaviate client...")
-    logger.debug("Loading .env variables inside create_weaviate_client...")
-    load_dotenv()
-    logger.debug(".env loaded.")
+from . import config
 
-    client = weaviate.connect_to_local()
-    logger.info("Weaviate client object created using connect_to_local().")
+def create_weaviate_client():
+    """Creates a Weaviate client, connecting to a URL from env vars if available."""
+    logger.debug("Attempting to create Weaviate client...")
+    load_dotenv()
+
+    if config.WEAVIATE_URL:
+        logger.info(f"Connecting to Weaviate at URL: {config.WEAVIATE_URL}")
+        client = weaviate.connect_to_custom(
+            http_host=config.WEAVIATE_URL.split(":")[-2].strip("/"),
+            http_port=config.WEAVIATE_URL.split(":")[-1],
+            http_secure=False,
+            grpc_host=config.WEAVIATE_URL.split(":")[-2].strip("/"),
+            grpc_port=50051,
+            grpc_secure=False,
+        )
+    else:
+        logger.info("WEAVIATE_URL not set, connecting to local Weaviate instance.")
+        client = weaviate.connect_to_local()
+
+    logger.info("Weaviate client object created.")
     return client
 
 
@@ -721,122 +735,65 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
     query_text: str,
     element_class="CodeElement",
     limit=5,
-    distance=0.7,
+    alpha=0.5,
 ):
-    """Finds relevant elements using vector search based on query text across multiple tenants."""
+    """Finds relevant elements using hybrid search based on query text across multiple tenants."""
     logger.info(
-        f"Starting find_relevant_elements across tenants {tenant_ids} for query: '{query_text}', class='{element_class}', limit={limit}, distance={distance}"
+        f"Starting hybrid search across tenants {tenant_ids} for query: '{query_text}', class='{element_class}', limit={limit}, alpha={alpha}"
     )
     all_results = []
     try:
-        logger.debug("find_relevant_elements: Importing google.generativeai...")
         import google.generativeai as genai
-        from code_scanner import embedding_model_name
 
-        logger.debug(
-            f"find_relevant_elements: Using embedding model: {embedding_model_name}"
-        )
-
-        if not embedding_model_name:
-            logger.error("find_relevant_elements: Embedding model name not configured.")
+        if not config.EMBEDDING_MODEL_NAME:
+            logger.error("Hybrid search: Embedding model name not configured.")
             return []
 
-        logger.debug(
-            f"find_relevant_elements: Generating query vector for: '{query_text}'"
-        )
-        query_vector = None
-        try:
-            query_vector_result = genai.embed_content(
-                model=embedding_model_name,
-                content=query_text,
-                task_type="RETRIEVAL_QUERY",
-            )
-            query_vector = query_vector_result.get("embedding")
-        except Exception as embed_e:
-            logger.exception(
-                f"find_relevant_elements: Exception during embedding generation: {embed_e}"
-            )
-            return []
+        query_vector = genai.embed_content(
+            model=config.EMBEDDING_MODEL_NAME,
+            content=query_text,
+            task_type="RETRIEVAL_QUERY",
+        ).get("embedding")
 
         if not query_vector:
-            logger.error(
-                f"find_relevant_elements: Failed to generate query vector for '{query_text}'. Result: {query_vector_result}"
-            )
+            logger.error(f"Failed to generate query vector for '{query_text}'.")
             return []
-        logger.debug(
-            f"find_relevant_elements: Generated query vector (length: {len(query_vector)}). Performing Weaviate search..."
-        )
 
-        collection = None
-        response = None
         collection = client.collections.get(element_class)
 
         for tenant_id in tenant_ids:
-            logger.debug(f"Querying tenant: {tenant_id}")
-            try:
-                response = collection.with_tenant(tenant_id).query.near_vector(
-                    near_vector=query_vector,
-                    limit=limit,
-                    distance=distance,
-                    return_metadata=wvc_query.MetadataQuery(distance=True),
-                    return_properties=[
-                        "name",
-                        "element_type",
-                        "file_path",
-                        "start_line",
-                        "end_line",
-                        "code_snippet",
-                        "docstring",
-                        "parameters",
-                        "return_type",
-                        "signature",
-                        "readable_id",
-                        "decorators",
-                        "attribute_accesses",
-                        "parent_scope_uuid",
-                        "llm_description",
-                        "user_clarification",
-                        "base_class_names",
-                    ],
-                )
-                logger.debug(
-                    f"find_relevant_elements: Weaviate near_vector query successful for tenant '{tenant_id}'."
-                )
-                if response and response.objects:
-                    logger.debug(
-                        f"find_relevant_elements: Processing {len(response.objects)} results from Weaviate for tenant '{tenant_id}'."
-                    )
-                    for obj in response.objects:
-                        all_results.append(
-                            {
-                                "uuid": str(obj.uuid),
-                                "properties": obj.properties,
-                                "distance": (
-                                    obj.metadata.distance if obj.metadata else None
-                                ),
-                                "_tenant_id": tenant_id,
-                            }
-                        )
-                else:
-                    logger.debug(
-                        f"find_relevant_elements: No objects found in Weaviate response for tenant '{tenant_id}'."
-                    )
-            except Exception as weaviate_e:
-                logger.error(
-                    f"find_relevant_elements: Exception during Weaviate near_vector query for tenant '{tenant_id}': {weaviate_e}"
-                )
+            logger.debug(f"Querying tenant with hybrid search: {tenant_id}")
+            response = collection.with_tenant(tenant_id).query.hybrid(
+                query=query_text,
+                vector=query_vector,
+                limit=limit,
+                alpha=alpha,
+                return_metadata=wvc_query.MetadataQuery(score=True),
+                return_properties=[
+                    "name", "element_type", "file_path", "start_line", "end_line",
+                    "code_snippet", "docstring", "parameters", "return_type",
+                    "signature", "readable_id", "decorators", "attribute_accesses",
+                    "parent_scope_uuid", "llm_description", "user_clarification",
+                    "base_class_names",
+                ],
+            )
 
-        # Sort aggregated results by distance (ascending) and apply overall limit
-        all_results.sort(key=lambda x: x.get("distance") or float("inf"))
+            if response and response.objects:
+                for obj in response.objects:
+                    all_results.append({
+                        "uuid": str(obj.uuid),
+                        "properties": obj.properties,
+                        "score": obj.metadata.score if obj.metadata else None,
+                        "_tenant_id": tenant_id,
+                    })
+
+        # Sort aggregated results by score (descending) and apply overall limit
+        all_results.sort(key=lambda x: x.get("score") or 0, reverse=True)
         final_results = all_results[:limit]
 
-        logger.info(
-            f"find_relevant_elements completed across tenants {tenant_ids}. Found {len(final_results)} final results (after limit)."
-        )
+        logger.info(f"Hybrid search completed. Found {len(final_results)} final results.")
         return final_results
 
     except Exception as e:
-        logger.exception(
-            f"Unexpected error during find_relevant_elements for '{query_text}' across tenants {tenant_ids}: {e}"
-        )
+        logger.exception(f"Unexpected error during hybrid search for '{query_text}': {e}")
         return []

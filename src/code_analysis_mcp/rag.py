@@ -16,28 +16,23 @@ from weaviate_client import (
     get_codebase_details,  # Import needed function
 )
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# --- Configuration ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# --- Model Initialization ---
 model = None
-embedding_model_name = None
-if GEMINI_API_KEY:
+if config.GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        GENERATION_MODEL_NAME = os.getenv(
-            "GENERATION_MODEL_NAME", "models/gemini-2.0-flash-001"
-        )
-        model = genai.GenerativeModel(GENERATION_MODEL_NAME)
-        embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "models/embedding-001")
+        genai.configure(api_key=config.GEMINI_API_KEY)
+        model = genai.GenerativeModel(config.GENERATION_MODEL_NAME)
     except Exception as e:
         logger.error(f"Error initializing Gemini models in rag.py: {e}")
         model = None
-        embedding_model_name = None
 else:
-    logger.warning("GEMINI_API_KEY not found in rag.py. LLM features disabled.")
+    logger.warning("GEMINI_API_KEY not found in config. LLM features disabled.")
 
 
 # --- RAG Function ---
@@ -53,8 +48,8 @@ async def answer_codebase_question(
     logger.info(f"Answering question: '{query_text}' for tenant '{tenant_id}'")
 
     # Ensure LLM models are available
-    if not model or not embedding_model_name:
-        return "ERROR: Generative or embedding model not configured in rag.py. Cannot answer question."
+    if not model:
+        return "ERROR: Generative model not configured in rag.py. Cannot answer question."
 
     # Ensure tenant_id is provided
     if not tenant_id:
