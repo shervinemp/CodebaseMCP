@@ -38,6 +38,7 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         self.codebase_name = codebase_name
         self.patterns = patterns
         self.dirty_files: Set[str] = set() # Track files that need scanning
+        self.dirty_files_lock = threading.Lock() # Protect access to dirty_files
         self._rescan_timer: asyncio.TimerHandle | None = (
             None  # Timer for debouncing rescans
         )
@@ -123,11 +124,13 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                     self._delete_file_data(path), self.loop or asyncio.new_event_loop()
                 )
                 # Also remove from dirty set if it was there (e.g. created then deleted quickly)
-                self.dirty_files.discard(path)
+                with self.dirty_files_lock:
+                    self.dirty_files.discard(path)
 
             # --- Global Rescan Debounce Logic ---
             elif event_type in ["modified", "created"]:
-                self.dirty_files.add(path)
+                with self.dirty_files_lock:
+                    self.dirty_files.add(path)
 
                 if not self.loop:
                     logger.error(
@@ -135,14 +138,8 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                     )
                     return
 
-                # Cancel any pending rescan timer
-                if self._rescan_timer:
-                    self._rescan_timer.cancel()
-
-                # Schedule the actual rescan trigger after a delay
-                self._rescan_timer = self.loop.call_later(
-                    RESCAN_DEBOUNCE_DELAY, self._schedule_rescan_coroutine
-                )
+                # Schedule the debounce via thread-safe call to the loop
+                self.loop.call_soon_threadsafe(self._schedule_debounce)
             # --- End Global Rescan Debounce Logic ---
 
         except Exception as e:
@@ -164,6 +161,18 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         except Exception as e:
             logger.error(f"Async delete task failed for {abs_path}: {e}")
 
+    def _schedule_debounce(self):
+        """
+        Runs on the main loop. Cancels existing timer and sets a new one.
+        Thread-safe because it's invoked via call_soon_threadsafe.
+        """
+        if self._rescan_timer:
+            self._rescan_timer.cancel()
+
+        self._rescan_timer = self.loop.call_later(
+            RESCAN_DEBOUNCE_DELAY, self._schedule_rescan_coroutine
+        )
+
     def _schedule_rescan_coroutine(self):
         """Schedules the _rescan_codebase coroutine to run thread-safely."""
         if not self.loop or not self.loop.is_running():
@@ -176,8 +185,9 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         )
 
         # Snapshot dirty files and clear the set
-        files_to_scan = list(self.dirty_files)
-        self.dirty_files.clear()
+        with self.dirty_files_lock:
+            files_to_scan = list(self.dirty_files)
+            self.dirty_files.clear()
 
         if not files_to_scan:
              return
