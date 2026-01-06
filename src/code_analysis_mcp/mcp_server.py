@@ -26,7 +26,12 @@ from watchdog.events import (
 
 from code_scanner import (
     enrich_element,
+    enrich_elements_batch,
     _scan_cleanup_and_upload,
+)
+from file_watcher import (
+    start_watcher,
+    stop_watcher,
 )
 from weaviate_client import (
     create_weaviate_client,
@@ -138,280 +143,92 @@ async def background_generate_summary(client, codebase_name: str):
 
 
 # --- File Watcher Logic ---
+# Logic moved to file_watcher.py
+# Use start_watcher and stop_watcher imported from file_watcher.py
+# We need to bridge the "manager" interface expected by file_watcher
+# to the global_weaviate_client here.
 
-
-class AnalysisTriggerHandler(FileSystemEventHandler):
-    """Triggers analysis when a watched file is modified or created."""
-
-    def __init__(self, client, codebase_name: str, patterns: list[str]):
+class WeaviateManagerBridge:
+    """Bridges calls from FileWatcher to the Weaviate client functions."""
+    def __init__(self, client):
         self.client = client
-        self.codebase_name = codebase_name
-        self.patterns = patterns
-        self.last_event_time = {}
+
+    def get_codebase_details(self, codebase_name):
+        return get_codebase_details(self.client, codebase_name)
+
+    def update_codebase_registry(self, codebase_name, updates):
+        return update_codebase_registry(self.client, codebase_name, updates)
+
+    def delete_elements_by_file_path(self, codebase_name, path):
+        return delete_elements_by_file_path(self.client, codebase_name, path)
+
+    def delete_code_file(self, codebase_name, path):
+        return delete_code_file(self.client, codebase_name, path)
+
+    def queue_llm_processing(self, codebase_name, uuids, skip_enriched=True):
+        """Adds LLM tasks to the background queue."""
+        logger.info(f"Queueing LLM processing for {len(uuids)} items in {codebase_name}")
+        # This needs to schedule tasks on the main event loop
+        # Since this method might be called from a thread, we use run_coroutine_threadsafe if needed,
+        # but here we are just adding to a set and creating tasks.
+        # However, asyncio.create_task must be called inside a loop.
+
         try:
-            self.loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            self.loop = None
-
-    def _should_process(self, event_path):
-        """Check if the event path matches the patterns."""
-        if not event_path:
+            logger.error("No running loop found to schedule LLM tasks.")
             return False
-        return any(event_path.endswith(p.strip("*")) for p in self.patterns)
 
-    def _run_async_task(self, coro):
-        """Safely run an async task from a sync handler thread."""
-        if self.loop and self.loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            try:
-                future.result(timeout=60)
-            except TimeoutError:
-                logger.error(
-                    f"Watcher: Async task timed out for codebase {self.codebase_name}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Watcher: Async task failed for codebase {self.codebase_name}: {e}"
-                )
-        else:
-            try:
-                asyncio.run(coro)
-            except Exception as e:
-                logger.error(
-                    f"Watcher: Async task failed (new loop) for codebase {self.codebase_name}: {e}"
-                )
-
-    def process(self, event):
-        """Process file system event: Scan and Upload for the specific codebase."""
-        if event.is_directory or not self._should_process(event.src_path):
-            return
-
-        event_type = event.event_type
-        path = event.src_path
-        debounce_period = 2.0
-        current_time = time.time()
-
-        last_time = self.last_event_time.get(path, 0)
-        if current_time - last_time < debounce_period:
-            logger.debug(f"Debouncing {event_type} event for: {path}")
-            return
-
-        self.last_event_time[path] = current_time
-        logger.info(
-            f"Watcher: Detected {event_type} for {path} in codebase '{self.codebase_name}'. Triggering update."
+        # We can trigger batch processing here
+        task = loop.create_task(
+            _process_llm_batch(self.client, codebase_name, uuids)
         )
+        background_llm_tasks.add(task)
+        task.add_done_callback(background_llm_tasks.discard)
+        return True
 
-        try:
-            if event_type == "deleted":
-                logger.info(
-                    f"Watcher: Deleting data for {path} in tenant '{self.codebase_name}'"
-                )
-                delete_elements_by_file_path(self.client, self.codebase_name, path)
-                delete_code_file(self.client, self.codebase_name, path)
-            else:
-                logger.info(
-                    f"Watcher: Running scan for {path} in tenant '{self.codebase_name}'"
-                )
-                codebase_details = get_codebase_details(self.client, self.codebase_name)
-                if codebase_details and codebase_details.get("directory"):
-                    codebase_dir = codebase_details["directory"]
-                    self._run_async_task(
-                        _scan_cleanup_and_upload(
-                            self.client, codebase_dir, tenant_id=self.codebase_name
-                        )
-                    )
-                else:
-                    logger.error(
-                        f"Watcher: Could not get codebase directory for '{self.codebase_name}' to trigger scan."
-                    )
-
-        except Exception as e:
-            logger.error(
-                f"Watcher: Error processing event for {path} in codebase '{self.codebase_name}': {e}"
-            )
-
-    def on_modified(self, event: FileModifiedEvent):
-        self.process(event)
-
-    def on_created(self, event: FileCreatedEvent):
-        self.process(event)
-
-    def on_deleted(self, event: FileDeletedEvent):
-        self.process(event)
-
-
-def watcher_thread_target(
-    codebase_name: str, directory: str, stop_event: threading.Event
-):
-    """Target function for the watcher thread."""
-    global global_weaviate_client
-    logger.info(
-        f"Watcher thread started for codebase '{codebase_name}' on directory '{directory}'"
-    )
-    patterns = ["*.py"]
-    event_handler = AnalysisTriggerHandler(
-        client=global_weaviate_client,
-        codebase_name=codebase_name,
-        patterns=patterns,
-    )
-    observer = Observer()
-    observer.schedule(event_handler, directory, recursive=True)
-    observer.start()
-    logger.info(f"Observer started for '{codebase_name}'.")
-
+async def _process_llm_batch(client, tenant_id, uuids, refine=False):
+    """Internal helper to run batch enrichment and optional refinement."""
     try:
-        while not stop_event.wait(timeout=WATCHER_POLLING_INTERVAL):
-            if not global_weaviate_client or not global_weaviate_client.is_connected():
-                logger.warning(
-                    f"Watcher thread for '{codebase_name}': Weaviate client disconnected. Stopping watcher."
-                )
-                break
+        result = await enrich_elements_batch(client, tenant_id, uuids)
 
-            details = get_codebase_details(global_weaviate_client, codebase_name)
-            if not details:
-                logger.warning(
-                    f"Watcher thread for '{codebase_name}': Codebase details not found in registry. Stopping watcher."
-                )
-                break
-            if not details.get("watcher_active", False):
-                logger.info(
-                    f"Watcher thread for '{codebase_name}': watcher_active flag is False in registry. Stopping watcher."
-                )
-                break
+        if refine:
+            # We don't have list of successful uuids easily from enrich_elements_batch
+            # unless we modify it to return them.
+            # Currently returns counts.
+            # Assuming we proceed with refinement for all, handling errors individually.
+            # However, refine_element_description checks if element exists.
 
-            logger.debug(
-                f"Watcher thread for '{codebase_name}': Still active, polling again."
-            )
+            # Since refinement is slow, we might want to batch this too or just iterate.
+            # refine_element_description is one-by-one.
+            logger.info(f"Starting refinement for {len(uuids)} elements in {tenant_id}")
+            for uuid in uuids:
+                # We reuse process_element_llm's refinement logic or call direct
+                # process_element_llm calls enrich then refine.
+                # Here we already enriched.
+                # Let's call refine_element_description directly.
+                try:
+                    async with llm_semaphore:
+                         await refine_element_description(client, tenant_id, uuid)
+                except Exception as e:
+                    logger.error(f"Refinement failed for {uuid}: {e}")
 
     except Exception as e:
-        logger.error(f"Watcher thread for '{codebase_name}' encountered an error: {e}")
-    finally:
-        logger.info(f"Watcher thread for '{codebase_name}': Stopping observer...")
-        observer.stop()
-        observer.join()
-        logger.info(
-            f"Watcher thread for '{codebase_name}': Observer stopped and joined."
-        )
-        if global_weaviate_client and global_weaviate_client.is_connected():
-            update_codebase_registry(
-                global_weaviate_client, codebase_name, {"watcher_active": False}
-            )
+        logger.error(f"Error in background LLM batch: {e}")
 
+# Override start/stop watcher to use the bridge
+async def start_watcher_wrapper(codebase_name: str) -> tuple[bool, str]:
+    if not global_weaviate_client:
+         return False, "Weaviate client not initialized"
+    manager = WeaviateManagerBridge(global_weaviate_client)
+    # start_watcher is synchronous but launches a thread
+    return start_watcher(manager, ACTIVE_WATCHERS, codebase_name)
 
-def start_watcher(codebase_name: str) -> tuple[bool, str]:
-    """Starts the file watcher for a given codebase in a separate thread."""
-    global ACTIVE_WATCHERS, global_weaviate_client
-    logger.info(f"Attempting to start watcher for codebase '{codebase_name}'")
-
-    if not global_weaviate_client or not global_weaviate_client.is_connected():
-        msg = "Cannot start watcher: Weaviate client not connected."
-        logger.error(msg)
-        return False, msg
-
-    details = get_codebase_details(global_weaviate_client, codebase_name)
-    if not details:
-        msg = f"Cannot start watcher: Codebase '{codebase_name}' not found in registry."
-        logger.error(msg)
-        return False, msg
-
-    directory = details.get("directory")
-    if not directory or not os.path.isdir(directory):
-        msg = f"Cannot start watcher: Codebase '{codebase_name}' directory '{directory}' not found or invalid."
-        logger.error(msg)
-        return False, msg
-
-    if codebase_name in ACTIVE_WATCHERS:
-        msg = f"Watcher for codebase '{codebase_name}' is already running in this server instance."
-        logger.warning(msg)
-        return False, msg
-
-    if details.get("watcher_active", False):
-        msg = f"Watcher for codebase '{codebase_name}' appears to be active (possibly in another instance). Cannot start duplicate."
-        logger.error(msg)
-        return False, msg
-
-    try:
-        if not update_codebase_registry(
-            global_weaviate_client, codebase_name, {"watcher_active": True}
-        ):
-            msg = f"Failed to update watcher status in registry for codebase '{codebase_name}'."
-            logger.error(msg)
-            return False, msg
-
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=watcher_thread_target,
-            args=(codebase_name, directory, stop_event),
-            daemon=True,
-        )
-        thread.start()
-
-        ACTIVE_WATCHERS[codebase_name] = {
-            "thread": thread,
-            "stop_event": stop_event,
-            "directory": directory,
-        }
-        msg = f"File watcher started successfully for codebase '{codebase_name}' on directory '{directory}'."
-        logger.info(msg)
-        return True, msg
-
-    except Exception as e:
-        logger.exception(f"Failed to start watcher for codebase '{codebase_name}': {e}")
-        update_codebase_registry(
-            global_weaviate_client, codebase_name, {"watcher_active": False}
-        )
-        return False, f"Failed to start watcher: {e}"
-
-
-def stop_watcher(codebase_name: str) -> tuple[bool, str]:
-    """Signals a watcher thread to stop and updates the registry."""
-    global ACTIVE_WATCHERS, global_weaviate_client
-    logger.info(f"Attempting to stop watcher for codebase '{codebase_name}'")
-
-    if not global_weaviate_client or not global_weaviate_client.is_connected():
-        msg = "Cannot stop watcher: Weaviate client not connected."
-        logger.error(msg)
-        return False, msg
-
-    logger.info(f"Setting watcher_active=False in registry for '{codebase_name}'")
-    update_success = update_codebase_registry(
-        global_weaviate_client, codebase_name, {"watcher_active": False}
-    )
-    if not update_success:
-        logger.error(
-            f"Failed to update watcher status in registry for '{codebase_name}', but attempting local stop."
-        )
-
-    watcher_info = ACTIVE_WATCHERS.get(codebase_name)
-    if watcher_info:
-        logger.info(
-            f"Found active watcher for '{codebase_name}' in this instance. Signaling stop."
-        )
-        stop_event = watcher_info.get("stop_event")
-        thread = watcher_info.get("thread")
-
-        if stop_event:
-            stop_event.set()
-
-        if thread and thread.is_alive():
-            logger.info(
-                f"Waiting briefly for watcher thread '{codebase_name}' to join..."
-            )
-            thread.join(timeout=WATCHER_POLLING_INTERVAL + 2)
-            if thread.is_alive():
-                logger.warning(
-                    f"Watcher thread '{codebase_name}' did not exit cleanly after stop signal."
-                )
-
-        if codebase_name in ACTIVE_WATCHERS:
-            del ACTIVE_WATCHERS[codebase_name]
-        msg = f"Stop signal sent to local watcher for codebase '{codebase_name}'. Registry updated."
-        logger.info(msg)
-        return True, msg
-    else:
-        msg = f"No active watcher found for codebase '{codebase_name}' in this server instance. Registry status set to inactive."
-        logger.info(msg)
-        return True, msg
+async def stop_watcher_wrapper(codebase_name: str) -> tuple[bool, str]:
+    if not global_weaviate_client:
+         return False, "Weaviate client not initialized"
+    manager = WeaviateManagerBridge(global_weaviate_client)
+    return stop_watcher(manager, ACTIVE_WATCHERS, codebase_name)
 
 
 # --- Lifespan Management ---
@@ -508,9 +325,10 @@ async def lifespan(app: FastMCP):
     active_watcher_names = list(ACTIVE_WATCHERS.keys())
     if active_watcher_names:
         logger.info(f"Found active watchers for codebases: {active_watcher_names}")
+        manager = WeaviateManagerBridge(global_weaviate_client)
         for codebase_name_shutdown in active_watcher_names:
             logger.info(f"Lifespan: Stopping watcher for '{codebase_name_shutdown}'...")
-            stop_success, stop_msg = stop_watcher(codebase_name_shutdown)
+            stop_success, stop_msg = stop_watcher(manager, ACTIVE_WATCHERS, codebase_name_shutdown)
             if not stop_success:
                 logger.error(
                     f"Lifespan: Error stopping watcher for '{codebase_name_shutdown}': {stop_msg}"
@@ -547,7 +365,6 @@ logger.info("--- Attempting FastMCP instantiation ---")
 
 mcp = FastMCP(
     name="code-analysis-mcp",
-    description="MCP Server for Python Code Analysis using AST, Weaviate, and Gemini, with codebase management.",
     lifespan=lifespan,
 )
 logger.info("--- FastMCP instantiation successful ---")
@@ -889,14 +706,15 @@ async def scan_codebase(
         if LLM_ENABLED and processed_uuids:
             llm_tasks_started = len(processed_uuids)
             logger.info(
-                f"Scheduling {llm_tasks_started} elements for LLM processing in tenant '{tenant_id}'."
+                f"Scheduling {llm_tasks_started} elements for batch LLM processing in tenant '{tenant_id}'."
             )
-            for uuid in processed_uuids:
-                llm_task = asyncio.create_task(
-                    process_element_llm(client, uuid, tenant_id)
-                )
-                background_llm_tasks.add(llm_task)
-                llm_task.add_done_callback(background_llm_tasks.discard)
+            # Use batch processing task
+            llm_task = asyncio.create_task(
+                _process_llm_batch(client, tenant_id, processed_uuids, refine=True)
+            )
+            background_llm_tasks.add(llm_task)
+            llm_task.add_done_callback(background_llm_tasks.discard)
+
             final_message += (
                 f" Background LLM enrichment started for {llm_tasks_started} elements."
             )
@@ -906,7 +724,7 @@ async def scan_codebase(
         logger.info(
             f"Scan Codebase Tool: Automatically starting watcher for '{codebase_name}'."
         )
-        watcher_started, watcher_msg = start_watcher(codebase_name)
+        watcher_started, watcher_msg = await start_watcher_wrapper(codebase_name)
         if watcher_started:
             final_message += f" {watcher_msg}"
             logger.info(
@@ -1008,7 +826,7 @@ async def select_codebase(
                 logger.info(
                     f"select_codebase: Stopping watcher for previously active codebase '{old_codebase_name}'."
                 )
-                stop_success, stop_msg = stop_watcher(old_codebase_name)
+                stop_success, stop_msg = await stop_watcher_wrapper(old_codebase_name)
                 if not stop_success:
                     logger.warning(
                         f"select_codebase: Failed to stop watcher for '{old_codebase_name}': {stop_msg}"
@@ -1064,7 +882,7 @@ async def delete_codebase(
         logger.info(
             f"Attempting to stop watcher for codebase '{codebase_name}' before deletion."
         )
-        stop_success, stop_msg = stop_watcher(codebase_name)
+        stop_success, stop_msg = await stop_watcher_wrapper(codebase_name)
         if not stop_success:
             logger.warning(
                 f"Could not definitively stop watcher for '{codebase_name}': {stop_msg}. Proceeding with deletion."
@@ -1590,18 +1408,18 @@ async def trigger_llm_processing(
         logger.info(
             f"Scheduling LLM processing for {len(uuids_to_process)} elements in codebase '{tenant_id}'."
         )
-        count = 0
-        for uuid_item in uuids_to_process:
-            task = asyncio.create_task(
-                process_element_llm(client, uuid_item, tenant_id)
-            )
-            background_llm_tasks.add(task)
-            task.add_done_callback(background_llm_tasks.discard)
-            count += 1
+
+        # Use batch processing task
+        count = len(uuids_to_process)
+        task = asyncio.create_task(
+            _process_llm_batch(client, tenant_id, uuids_to_process, refine=True)
+        )
+        background_llm_tasks.add(task)
+        task.add_done_callback(background_llm_tasks.discard)
 
         return {
             "status": "success",
-            "message": f"Background LLM processing triggered for {count} elements in codebase '{tenant_id}'.",
+            "message": f"Background batch LLM processing triggered for {count} elements in codebase '{tenant_id}'.",
         }
     except Exception as e:
         logger.exception(
@@ -1627,7 +1445,7 @@ async def start_watcher_tool(
     ],
 ):
     """MCP tool to start the file watcher."""
-    success, message = start_watcher(codebase_name)
+    success, message = await start_watcher_wrapper(codebase_name)
     return {"status": "success" if success else "error", "message": message}
 
 
@@ -1644,7 +1462,7 @@ async def stop_watcher_tool(
     ],
 ):
     """MCP tool to stop the file watcher."""
-    success, message = stop_watcher(codebase_name)
+    success, message = await stop_watcher_wrapper(codebase_name)
     return {"status": "success" if success else "error", "message": message}
 
 

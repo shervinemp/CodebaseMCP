@@ -310,6 +310,47 @@ def get_all_code_files(client, tenant_id: str):
         return {}
 
 
+def get_code_files_metadata(client, tenant_id: str, file_paths: List[str]):
+    """Retrieves metadata (last_modified) for specific file paths in a tenant."""
+    logger.info(f"Fetching metadata for {len(file_paths)} files in tenant '{tenant_id}'.")
+    try:
+        collection = client.collections.get("CodeFile")
+
+        # Optimize: If file_paths is empty, return empty dict
+        if not file_paths:
+            return {}
+
+        # Handle chunking if file_paths is too large for a single filter query
+        chunk_size = 100
+        files_data = {}
+
+        for i in range(0, len(file_paths), chunk_size):
+            chunk = file_paths[i:i + chunk_size]
+            filters = wvc_query.Filter.by_property("path").contains_any(chunk)
+
+            response = collection.with_tenant(tenant_id).query.fetch_objects(
+                filters=filters,
+                limit=len(chunk),
+                return_properties=["path", "last_modified"]
+            )
+
+            for obj in response.objects:
+                try:
+                    stored_datetime = obj.properties["last_modified"]
+                    if stored_datetime.tzinfo is None:
+                        stored_datetime = stored_datetime.replace(
+                            tzinfo=datetime.timezone.utc
+                        )
+                    files_data[obj.properties["path"]] = stored_datetime
+                except Exception as parse_e:
+                    logger.error(f"Error processing last_modified for {obj.properties['path']}: {parse_e}")
+
+        return files_data
+    except Exception as e:
+        logger.exception(f"Error fetching metadata for files in tenant '{tenant_id}': {e}")
+        return {}
+
+
 def find_element_by_name(
     client,
     tenant_ids: List[str],

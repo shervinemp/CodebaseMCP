@@ -6,9 +6,11 @@ import datetime
 import asyncio
 import re
 from dotenv import load_dotenv
+from concurrent.futures import ProcessPoolExecutor
 from weaviate_client import (  # Use relative import
     create_weaviate_client,
     get_all_code_files,
+    get_code_files_metadata,
     delete_elements_by_file_path,
     delete_code_file,
     add_objects_batch,
@@ -19,7 +21,7 @@ from weaviate_client import (  # Use relative import
 )
 from weaviate.util import generate_uuid5
 import logging
-
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,14 @@ def find_python_files(directory):
 
     python_files = []
     start_dir = os.path.abspath(directory)
+    # Using os.scandir could be slightly faster but os.walk is robust.
+    # For now, sticking to os.walk or checking if we need scandir optimization.
+    # Scenario 1 suggests optimization here, but we are prioritizing critical refactors.
+    # Let's keep synchronous finding for now as it's not the biggest blocker compared to full scan.
+    # Wait, Scenario 1 IS synchronous file walking.
+    # But now we support specific files scanning, which bypasses this for updates.
+    # For initial scan, we can optimize later if needed.
+
     python_files = [
         os.path.join(root, f)
         for root, _, files in os.walk(start_dir)
@@ -74,11 +84,14 @@ def find_python_files(directory):
     return python_files
 
 
-def read_file_content(abs_path):
-    """Reads the content of a file at the given absolute path."""
-    with open(abs_path, "r", encoding="utf-8") as f:
-        return f.read()
-
+async def read_file_content(abs_path):
+    """Reads the content of a file at the given absolute path asynchronously."""
+    try:
+        async with aiofiles.open(abs_path, "r", encoding="utf-8") as f:
+            return await f.read()
+    except Exception as e:
+        logger.error(f"Error reading file {abs_path}: {e}")
+        return None
 
 def parse_code(file_content, file_path, verbose=VERBOSE_LOGGING):
     """Parses code using AST. file_path is used for error reporting."""
@@ -89,14 +102,32 @@ def parse_code(file_content, file_path, verbose=VERBOSE_LOGGING):
             logger.warning(f"Syntax error parsing {file_path}: {e}")
         return None
 
+def process_file_worker(file_path_rel, file_content, file_uuid, file_mtime):
+    """
+    Worker function to parse code and visit nodes.
+    Run in a separate process to avoid blocking the event loop with CPU-bound AST operations.
+    """
+    try:
+        parsed_code = parse_code(file_content, file_path_rel, VERBOSE_LOGGING)
+        if parsed_code is None:
+            return [], []
+
+        # Initialize visitor with explicit mtime
+        visitor = CodeVisitor(file_path_rel, file_content, file_uuid, file_mtime=file_mtime)
+        visitor.visit(parsed_code)
+
+        return visitor.elements, visitor.references
+    except Exception as e:
+        # Logging in a worker process might need configuration to show up in main logs
+        # For now, print to stderr or just return empty
+        print(f"Worker failed for {file_path_rel}: {e}")
+        return [], []
+
 
 # --- AST Visitor (Structural Analysis Only) ---
 class CodeVisitor(ast.NodeVisitor):
-    def __init__(self, file_path, code_content, file_uuid):
+    def __init__(self, file_path, code_content, file_uuid, file_mtime=None):
         """Initializes the visitor."""
-        logger.debug(
-            f"CodeVisitor initialized with file_path: {file_path}, file_uuid: {file_uuid}"
-        )
         self.file_path = file_path
         self.code_content = code_content
         self.file_uuid = file_uuid
@@ -105,18 +136,12 @@ class CodeVisitor(ast.NodeVisitor):
         self.element_uuid_map = {}
         self.scope_stack = []
         self.current_attributes = []
-        try:
-            self.file_mtime = datetime.datetime.fromtimestamp(
-                os.path.getmtime(self.file_path), tz=datetime.timezone.utc
-            )
-        except FileNotFoundError:
-            logger.error(
-                f"CodeVisitor: File not found for mtime check: {self.file_path}"
-            )
-            self.file_mtime = datetime.datetime.fromtimestamp(
-                0, tz=datetime.timezone.utc
-            )
-        logger.debug(f"CodeVisitor instance created for {file_path}")
+
+        if file_mtime:
+            self.file_mtime = file_mtime
+        else:
+            # Fallback (should generally be provided)
+            self.file_mtime = datetime.datetime.now(datetime.timezone.utc)
 
     def _get_element_key(self, element_type, name, start_line):
         """Generates a consistent key for an element."""
@@ -132,9 +157,6 @@ class CodeVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         """Visits FunctionDef nodes (functions and methods)."""
-        logger.debug(
-            f"Visiting FunctionDef: {node.name} at line {node.lineno} in {self.file_path}"
-        )
         func_key = self._get_element_key("function", node.name, node.lineno)
         func_uuid = self._generate_uuid(func_key)
         self.element_uuid_map[func_key] = func_uuid
@@ -233,9 +255,6 @@ class CodeVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node):
         """Visits ClassDef nodes."""
-        logger.debug(
-            f"Visiting ClassDef: {node.name} at line {node.lineno} in {self.file_path}"
-        )
         class_key = self._get_element_key("class", node.name, node.lineno)
         class_uuid = self._generate_uuid(class_key)
         self.element_uuid_map[class_key] = class_uuid
@@ -503,152 +522,206 @@ def _extract_identifiers(code_snippet: str) -> list[str]:
 
 
 async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
+    """Wrapper for single element enrichment using the batch logic."""
+    result = await enrich_elements_batch(client, tenant_id, [element_uuid])
+    return result.get("success_count", 0) > 0
+
+async def enrich_elements_batch(client, tenant_id: str, element_uuids: list[str]) -> dict:
     """
-    Fetches an element from a specific tenant, generates its initial LLM description and embedding,
-    and updates it in Weaviate. Runs LLM calls in a thread.
-    Returns True on success/no action needed, False on failure.
+    Fetches elements in batch, generates LLM descriptions and embeddings in parallel,
+    and updates them in Weaviate using batch operations.
     """
     if not GENERATE_LLM_DESCRIPTIONS or not model or not embedding_model_name:
-        logger.debug(
-            f"LLM generation disabled, skipping enrichment for {element_uuid} in tenant {tenant_id}"
-        )
-        return True
+        logger.debug(f"LLM generation disabled, skipping enrichment for {len(element_uuids)} elements.")
+        return {"success_count": 0, "failed_count": 0}
 
-    logger.debug(f"Attempting enrichment for {element_uuid} in tenant {tenant_id}")
+    logger.info(f"Starting batch enrichment for {len(element_uuids)} elements in tenant {tenant_id}")
+
+    # 1. Fetch all elements details
+    elements_to_process = []
+    # We can use fetch_objects with filter UUID contains_any
     try:
-        element = get_element_details(client, tenant_id, element_uuid)
-        if not element:
-            logger.error(
-                f"enrich_element: Element {element_uuid} not found in tenant {tenant_id}."
+        collection = client.collections.get("CodeElement")
+        # Chunking UUIDs for query if necessary (e.g. 100 at a time)
+        chunk_size = 100
+        fetched_objects = []
+        for i in range(0, len(element_uuids), chunk_size):
+            chunk = element_uuids[i:i+chunk_size]
+            # Filters need weaviate.classes.query
+            from weaviate.classes.query import Filter
+            response = await asyncio.to_thread(
+                collection.with_tenant(tenant_id).query.fetch_objects,
+                filters=Filter.by_id().contains_any(chunk),
+                limit=len(chunk),
+                include_vector=True
             )
-            return False
+            fetched_objects.extend(response.objects)
+    except Exception as e:
+        logger.error(f"Error fetching elements for batch enrichment: {e}")
+        return {"success_count": 0, "failed_count": len(element_uuids)}
 
-        props = element.properties
-        current_desc = props.get("llm_description", "")
-        has_vector = element.vector is not None
+    # 2. Process items
+    objects_to_update = []
 
-        if (
-            current_desc
-            and current_desc != "[Description not generated]"
-            and has_vector
-        ):
-            logger.debug(
-                f"Element {element_uuid} in tenant {tenant_id} already enriched, skipping."
-            )
-            return True
-
-        element_type = props.get("element_type", "element")
-        name = props.get("name", "Unknown")
-        readable_id = props.get("readable_id", "N/A")
-        signature = props.get("signature", "")
-        docstring = props.get("docstring", "")
-        code_snippet = props.get("code_snippet", "")
-
-        content_to_embed = (
-            f"{element_type.capitalize()}: {name}\nReadable ID: {readable_id}\n"
-        )
-        if signature:
-            content_to_embed += f"Signature: {signature}\n"
-        if docstring:
-            content_to_embed += f"Docstring: {docstring}\n"
-        content_to_embed += f"Code:\n{code_snippet}"
-
-        prompt = f"Provide a concise, one-sentence description of the following Python {element_type} named '{name}'.\n"
-        if readable_id != "N/A":
-            prompt += f"Readable ID: {readable_id}\n"
-        if signature:
-            prompt += f"Signature: {signature}\n"
-        prompt += f"Code:\n```python\n{code_snippet}\n```\n"
-        if docstring:
-            prompt += f"Docstring:\n{docstring}\n"
-        prompt += "\nConcise description:"
-
-        new_vector = None
-        new_description = current_desc
-
+    async def process_single_item(obj):
         try:
-            logger.debug(
-                f"Generating embedding for {element_uuid} ({name}) in tenant {tenant_id}"
-            )
-            embedding_result = await asyncio.to_thread(
-                genai.embed_content,
-                model=embedding_model_name,
-                content=content_to_embed,
-                task_type="RETRIEVAL_DOCUMENT",
-            )
-            new_vector = embedding_result.get("embedding")
-        except google.api_core.exceptions.GoogleAPIError as embed_e:
-            logger.warning(
-                f"Embedding generation failed for {element_uuid} in tenant {tenant_id}: {type(embed_e).__name__}: {embed_e}"
-            )
-            raise
+            props = obj.properties
+            uuid_str = str(obj.uuid)
+            current_desc = props.get("llm_description", "")
+            has_vector = obj.vector is not None
 
-        try:
-            logger.debug(
-                f"Generating initial description for {element_uuid} ({name}) in tenant {tenant_id}"
-            )
-            # Wrap synchronous LLM call
-            description_response = await asyncio.to_thread(
-                model.generate_content, prompt
-            )
-            generated_desc = description_response.text.strip()
-            new_description = generated_desc
-            logger.debug(
-                f"Generated description for {element_uuid} in tenant {tenant_id}: {new_description}"
-            )
-        except google.api_core.exceptions.GoogleAPIError as desc_e:
-            logger.warning(
-                f"Initial description generation failed for {element_uuid} in tenant {tenant_id}: {type(desc_e).__name__}: {desc_e}"
-            )
-            # Don't raise, just proceed without description if it fails
-            new_description = current_desc  # Keep old description if generation fails
+            if current_desc and current_desc != "[Description not generated]" and has_vector:
+                return None # Already done
 
-        if new_vector or (new_description and new_description != current_desc):
-            props_to_update = props.copy()
-            props_to_update["llm_description"] = new_description
-            logger.debug(
-                f"Updating element {element_uuid} in tenant {tenant_id} with new description/vector."
-            )
+            element_type = props.get("element_type", "element")
+            name = props.get("name", "Unknown")
+            readable_id = props.get("readable_id", "N/A")
+            signature = props.get("signature", "")
+            docstring = props.get("docstring", "")
+            code_snippet = props.get("code_snippet", "")
+
+            content_to_embed = f"{element_type.capitalize()}: {name}\nReadable ID: {readable_id}\n"
+            if signature: content_to_embed += f"Signature: {signature}\n"
+            if docstring: content_to_embed += f"Docstring: {docstring}\n"
+            content_to_embed += f"Code:\n{code_snippet}"
+
+            prompt = f"Provide a concise, one-sentence description of the following Python {element_type} named '{name}'.\n"
+            if readable_id != "N/A": prompt += f"Readable ID: {readable_id}\n"
+            if signature: prompt += f"Signature: {signature}\n"
+            prompt += f"Code:\n```python\n{code_snippet}\n```\n"
+            if docstring: prompt += f"Docstring:\n{docstring}\n"
+            prompt += "\nConcise description:"
+
+            # Run API calls
+            new_vector = None
+            new_description = current_desc
+
+            # Embed
             try:
-                # Wrap synchronous Weaviate call
-                collection = client.collections.get("CodeElement")
+                embedding_result = await asyncio.to_thread(
+                    genai.embed_content,
+                    model=embedding_model_name,
+                    content=content_to_embed,
+                    task_type="RETRIEVAL_DOCUMENT",
+                )
+                new_vector = embedding_result.get("embedding")
+            except Exception as e:
+                logger.warning(f"Embedding failed for {uuid_str}: {e}")
+
+            # Generate Description
+            try:
+                description_response = await asyncio.to_thread(
+                    model.generate_content, prompt
+                )
+                new_description = description_response.text.strip()
+            except Exception as e:
+                logger.warning(f"Description generation failed for {uuid_str}: {e}")
+
+            if new_vector or (new_description and new_description != current_desc):
+                updated_props = props.copy()
+                updated_props["llm_description"] = new_description
+                return {
+                    "uuid": uuid_str,
+                    "properties": updated_props,
+                    "vector": new_vector if new_vector else obj.vector
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error processing item {obj.uuid}: {e}")
+            return None
+
+    # Run processing in parallel
+    # Limit concurrency
+    sem = asyncio.Semaphore(10) # 10 concurrent LLM calls
+    async def limited_process(obj):
+        async with sem:
+            return await process_single_item(obj)
+
+    tasks = [limited_process(obj) for obj in fetched_objects]
+    results = await asyncio.gather(*tasks)
+
+    for res in results:
+        if res:
+            objects_to_update.append(res)
+
+    # 3. Batch Update
+    if objects_to_update:
+        logger.info(f"Updating {len(objects_to_update)} elements in batch for tenant {tenant_id}")
+        # Use add_objects_batch from weaviate_client
+        # Note: add_objects_batch uses insert_many. If objects exist, we need to know if it upserts.
+        # Weaviate `insert_many` typically fails on existing UUIDs unless we delete first?
+        # Actually, `client.batch` (v3) allowed replace. v4 `insert_many` might not.
+        # We might need to iterate and replace if batch update isn't straightforward or use `batch.add_object` loop.
+
+        # Let's use `add_objects_batch` but verify implementation in `weaviate_client.py`.
+        # `add_objects_batch` uses `collection.data.insert_many`.
+        # Weaviate v4 documentation says insert_many is for creation.
+        # For updates, we might have to use loop with replace, but we can parallelize the loop requests (HTTP/2 multiplexing).
+        # OR use batch.
+
+        # Re-implement batching here using client.batch (v4 dynamic batch) if possible for upsert?
+        # The v4 client has `batch.add_object`. If UUID exists, it depends on config?
+        # Usually it's safer to use replace() loop for updates if batch doesn't support upsert explicitly.
+        # BUT, to solve Scenario 17, we want to reduce round trips.
+        # Since we are already running inside `mcp_server`, let's just use `add_objects_batch` assuming we delete first?
+        # No, deleting destroys references! We must UPDATE (replace).
+
+        # So we cannot use `insert_many`.
+        # We must use `replace`.
+        # To optimize, we can run `replace` calls in parallel using asyncio.gather.
+
+        update_tasks = []
+        collection = client.collections.get("CodeElement")
+
+        async def update_single(obj_data):
+            try:
                 await asyncio.to_thread(
-                    collection.with_tenant(
-                        tenant_id
-                    ).data.replace,  # Corrected: replace was already wrapped, no change needed here. Retaining original wrap.
-                    uuid=element_uuid,
-                    properties=props_to_update,
-                    vector=(new_vector if new_vector else element.vector),
+                    collection.with_tenant(tenant_id).data.replace,
+                    uuid=obj_data["uuid"],
+                    properties=obj_data["properties"],
+                    vector=obj_data["vector"]
                 )
                 return True
-            except Exception as update_e:
-                logger.error(
-                    f"Failed to update element {element_uuid} in tenant {tenant_id} after enrichment: {type(update_e).__name__}: {update_e}"
-                )
+            except Exception as e:
+                logger.error(f"Update failed for {obj_data['uuid']}: {e}")
                 return False
-        else:
-            logger.debug(
-                f"No changes needed for {element_uuid} in tenant {tenant_id} after enrichment attempt."
-            )
-            return True
 
-    except Exception as e:
-        logger.exception(
-            f"Unexpected error during description refinement for {element_uuid} in tenant {tenant_id}: {type(e).__name__}: {e}"
-        )
-        return False
+        # Concurrency for DB writes
+        db_sem = asyncio.Semaphore(20)
+        async def limited_update(obj_data):
+            async with db_sem:
+                return await update_single(obj_data)
+
+        for obj_data in objects_to_update:
+            update_tasks.append(limited_update(obj_data))
+
+        update_results = await asyncio.gather(*update_tasks)
+        success_count = sum(1 for r in update_results if r)
+        return {"success_count": success_count, "failed_count": len(update_tasks) - success_count}
+
+    return {"success_count": 0, "failed_count": 0}
 
 
 async def _scan_cleanup_and_upload(
-    client, directory: str, tenant_id: str
+    client, directory: str, tenant_id: str, specific_files: list[str] = None
 ) -> tuple[str, list[str]]:
     """
     Internal helper to perform scan, cleanup, and upload for a specific tenant.
+
+    Args:
+        client: Weaviate client.
+        directory: Root directory of the codebase.
+        tenant_id: Tenant ID (codebase name).
+        specific_files: Optional list of absolute file paths to scan. If provided, only these files are processed.
+
     Returns status message and list of processed element UUIDs.
     """
     logger.info(
         f"Starting _scan_cleanup_and_upload for tenant '{tenant_id}' in directory '{directory}'"
     )
+    if specific_files:
+        logger.info(f"Targeted scan for {len(specific_files)} specific files.")
+
     processed_uuids_list = []
     final_status_messages = []
 
@@ -663,32 +736,75 @@ async def _scan_cleanup_and_upload(
         files_skipped_count = 0
         files_processed_count = 0
 
-        stored_files_data = get_all_code_files(client, tenant_id)
-        local_python_files = find_python_files(directory)
-        local_file_paths = set(local_python_files)
+        # Determine files to check
+        local_python_files = []
+        stored_files_data = {}
+        files_to_delete_completely = []
+
+        if specific_files:
+            # Targeted update
+            local_python_files = [f for f in specific_files if f.endswith(".py") and os.path.exists(f)]
+            # We only need metadata for these files
+            # Convert to relative paths for metadata lookup
+            rel_paths = []
+            for f in local_python_files:
+                try:
+                    rel_paths.append(os.path.relpath(f, start=directory).replace(os.sep, "/"))
+                except ValueError:
+                     # Path is not under directory, skip or handle?
+                     logger.warning(f"File {f} is not under {directory}. Skipping.")
+                     pass
+
+            stored_files_data = get_code_files_metadata(client, tenant_id, rel_paths)
+
+            # Check for deletions in specific list (if file doesn't exist anymore)
+            # But specific_files usually come from existing events.
+            # If deleted event, the file won't exist.
+            # If the caller passes a deleted file in specific_files, we handle it?
+            # Usually the watcher calls delete separately.
+            # But if we want to be safe:
+            for f in specific_files:
+                if not os.path.exists(f):
+                     try:
+                        rel = os.path.relpath(f, start=directory).replace(os.sep, "/")
+                        files_to_delete_completely.append(rel)
+                     except ValueError:
+                         pass
+
+        else:
+            # Full scan
+            stored_files_data = get_all_code_files(client, tenant_id)
+            local_python_files = find_python_files(directory)
+            local_file_paths = set()
+            for f in local_python_files:
+                 try:
+                    rel = os.path.relpath(f, start=directory).replace(os.sep, "/")
+                    local_file_paths.add(rel)
+                 except ValueError:
+                     pass
+
+            # Identify deleted files (only relevant for full scan)
+            for file_path in stored_files_data.keys():
+                if file_path not in local_file_paths:
+                    logger.info(f"File deleted locally: {file_path} (Tenant: {tenant_id})")
+                    files_to_delete_completely.append(file_path)
+
         files_to_process = []
         files_to_delete_elements_for = []
-        files_to_delete_completely = []
-        debug_info_for_status = ""
-
-        for file_path in stored_files_data.keys():
-            if file_path not in local_file_paths:
-                logger.info(f"File deleted locally: {file_path} (Tenant: {tenant_id})")
-                files_to_delete_completely.append(file_path)
 
         logger.debug("--- Starting file comparison loop ---")
-        for file_path in local_python_files:
+        for abs_file_path in local_python_files:
             current_mtime_dt = None
             stored_mtime_dt = None
             comparison_result = "ERROR_before_comparison"
-            project_root = "c:/Users/sherv/Desktop/Projects/ragcode"
-            abs_file_path_for_mtime = os.path.abspath(
-                os.path.join(project_root, file_path)
-            )
-            relative_file_path_for_lookup = file_path
 
             try:
-                current_mtime_float = os.path.getmtime(abs_file_path_for_mtime)
+                relative_file_path_for_lookup = os.path.relpath(abs_file_path, start=directory).replace(os.sep, "/")
+            except ValueError:
+                continue
+
+            try:
+                current_mtime_float = os.path.getmtime(abs_file_path)
                 current_mtime_dt = datetime.datetime.fromtimestamp(
                     current_mtime_float, tz=datetime.timezone.utc
                 )
@@ -697,12 +813,12 @@ async def _scan_cleanup_and_upload(
                 if stored_mtime_dt is None:
                     comparison_result = "NEW"
                     files_to_process.append(
-                        (relative_file_path_for_lookup, current_mtime_dt, "new")
+                        (relative_file_path_for_lookup, abs_file_path, current_mtime_dt, "new")
                     )
                 elif current_mtime_dt > stored_mtime_dt:
                     comparison_result = "MODIFIED"
                     files_to_process.append(
-                        (relative_file_path_for_lookup, current_mtime_dt, "modified")
+                        (relative_file_path_for_lookup, abs_file_path, current_mtime_dt, "modified")
                     )
                     files_to_delete_elements_for.append(relative_file_path_for_lookup)
                 else:
@@ -715,7 +831,7 @@ async def _scan_cleanup_and_upload(
 
             except FileNotFoundError:
                 logger.warning(
-                    f"File not found during mtime check: {abs_file_path_for_mtime}"
+                    f"File not found during mtime check: {abs_file_path}"
                 )
                 comparison_result = "ERROR_file_not_found"
             except Exception as e:
@@ -725,47 +841,63 @@ async def _scan_cleanup_and_upload(
                 comparison_result = f"ERROR_exception:_{e}"
 
         logger.debug("--- Finished file comparison loop ---")
-        logger.debug(f"Files marked for processing: {files_to_process}")
+        logger.debug(f"Files marked for processing: {len(files_to_process)}")
 
         files_to_clear = set(files_to_delete_elements_for + files_to_delete_completely)
 
-        logger.info("--- Scan Pass 2: Code Parsing and Element Extraction ---")
-        for file_path_rel, mtime_dt, status in files_to_process:
-            file_content = read_file_content(file_path_rel)
-            if file_content is None:
-                continue
+        # Parallel Processing
+        logger.info("--- Scan Pass 2: Code Parsing and Element Extraction (Parallel) ---")
 
-            file_uuid = generate_uuid5(file_path_rel)
-            code_files_to_batch.append(
-                {
-                    "uuid": file_uuid,
-                    "properties": {
-                        "path": file_path_rel,
-                        "last_modified": mtime_dt.isoformat(),
-                    },
-                }
-            )
+        loop = asyncio.get_running_loop()
 
-            parsed_code = parse_code(file_content, file_path_rel, VERBOSE_LOGGING)
-            if parsed_code is None:
-                continue
+        # Helper to read file and prep for worker - Executor passed in
+        async def prep_and_run_worker(file_info, executor):
+            rel_path, abs_path, mtime, status = file_info
+            content = await read_file_content(abs_path)
+            if content is None:
+                return None
 
-            visitor = CodeVisitor(file_path_rel, file_content, file_uuid)
+            file_uuid = generate_uuid5(rel_path)
+
+            # Add to batch for CodeFile object
+            code_file_obj = {
+                "uuid": file_uuid,
+                "properties": {
+                    "path": rel_path,
+                    "last_modified": mtime.isoformat(),
+                },
+            }
+
+            # Run CPU bound task in executor
             try:
-                visitor.visit(parsed_code)
-            except Exception as visit_e:
-                logger.exception(f"Error visiting nodes in {file_path_rel}: {visit_e}")
-                continue
+                elements, references = await loop.run_in_executor(
+                    executor, process_file_worker, rel_path, content, file_uuid, mtime
+                )
+                return code_file_obj, elements, references
+            except Exception as e:
+                logger.error(f"Error processing file {rel_path}: {e}")
+                return None
 
-            code_elements_to_batch.extend(visitor.elements)
-            processed_element_uuids.extend(
-                [el["uuid"] for el in visitor.elements if "uuid" in el]
-            )
-            references_to_batch.extend(visitor.references)
-            files_processed_count += 1
+        # Create executor once for all tasks
+        max_workers = os.cpu_count() or 4
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Create tasks
+            tasks = [prep_and_run_worker(info, executor) for info in files_to_process]
+
+            # Gather results
+            results = await asyncio.gather(*tasks)
+
+        for res in results:
+            if res:
+                c_file, c_elements, c_refs = res
+                code_files_to_batch.append(c_file)
+                code_elements_to_batch.extend(c_elements)
+                references_to_batch.extend(c_refs)
+                processed_element_uuids.extend([el["uuid"] for el in c_elements if "uuid" in el])
+                files_processed_count += 1
+
 
         scan_status_message = f"Scan completed for tenant '{tenant_id}'. Files processed: {files_processed_count}. Files skipped: {files_skipped_count}."
-        scan_status_message += debug_info_for_status
         logger.info(scan_status_message)
 
         final_status_messages.append(scan_status_message)
@@ -781,6 +913,9 @@ async def _scan_cleanup_and_upload(
             logger.info(
                 f"Deleting elements for {len(files_needing_element_deletion)} modified files in tenant '{tenant_id}'..."
             )
+            # Parallelize deletions? They are network bound.
+            # But delete_elements_by_file_path is sync (wrapped in to_thread maybe?).
+            # For now, let's keep it simple, but we can do simple loop.
             for file_path in files_needing_element_deletion:
                 if not delete_elements_by_file_path(client, tenant_id, file_path):
                     logger.warning(

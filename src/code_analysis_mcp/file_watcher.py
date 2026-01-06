@@ -10,12 +10,11 @@ from watchdog.events import (
     FileCreatedEvent,
     FileDeletedEvent,
 )
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Set
 
 # Assuming these imports are needed based on the moved code
-from .weaviate_client import WeaviateManager
-from .code_scanner import (
-    CodeScanner,
+from code_scanner import (
+    _scan_cleanup_and_upload,
     GENERATE_LLM_DESCRIPTIONS,
 )  # Import config flag
 
@@ -33,12 +32,12 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
     """Triggers analysis when a watched file is modified or created."""
 
     def __init__(
-        self, manager: WeaviateManager, codebase_name: str, patterns: list[str]
+        self, manager, codebase_name: str, patterns: list[str]
     ):
         self.manager = manager  # Store the manager instance
         self.codebase_name = codebase_name
         self.patterns = patterns
-        self.last_event_time: Dict[str, float] = {}
+        self.dirty_files: Set[str] = set() # Track files that need scanning
         self._rescan_timer: asyncio.TimerHandle | None = (
             None  # Timer for debouncing rescans
         )
@@ -88,24 +87,21 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 )
 
     def process(self, event):
-        """Process file system event: Scan and Upload for the specific codebase."""
+        """Process file system event: Queue specific files for Update."""
         if event.is_directory or not self._should_process(event.src_path):
             return
 
         event_type = event.event_type
         # Use absolute path for consistency
         path = os.path.abspath(event.src_path)
-        debounce_period = 2.0
-        current_time = time.time()
 
-        last_time = self.last_event_time.get(path, 0)
-        if current_time - last_time < debounce_period:
-            logger.debug(f"Debouncing {event_type} event for: {path}")
-            return
+        # Debounce Logic:
+        # Instead of tracking per-file timestamp and ignoring quick edits here,
+        # we add to a dirty set. The global timer will fire once after silence.
+        # This handles bulk edits naturally (1000 files added to set, 1 timer reset).
 
-        self.last_event_time[path] = current_time
         logger.info(
-            f"Watcher: Detected {event_type} for {path} in codebase '{self.codebase_name}'. Queueing update check."
+            f"Watcher: Detected {event_type} for {path} in codebase '{self.codebase_name}'. Adding to dirty list."
         )
 
         if not self.manager or not self.manager.client:
@@ -119,12 +115,20 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 logger.info(
                     f"Watcher: Deleting data for {path} in tenant '{self.codebase_name}'"
                 )
-                # Use manager methods (run in thread to avoid blocking watchdog)
+                # For deletions, we might want to act immediately or also queue?
+                # Deleting immediately avoids scanning a non-existent file.
+                # But if we queue, we can check existence later.
+                # Current logic: Delete immediately.
                 asyncio.run_coroutine_threadsafe(
                     self._delete_file_data(path), self.loop or asyncio.new_event_loop()
                 )
+                # Also remove from dirty set if it was there (e.g. created then deleted quickly)
+                self.dirty_files.discard(path)
+
             # --- Global Rescan Debounce Logic ---
             elif event_type in ["modified", "created"]:
+                self.dirty_files.add(path)
+
                 if not self.loop:
                     logger.error(
                         f"Watcher: No event loop available for {self.codebase_name} to schedule rescan."
@@ -134,14 +138,8 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 # Cancel any pending rescan timer
                 if self._rescan_timer:
                     self._rescan_timer.cancel()
-                    logger.debug(
-                        f"Watcher: Canceled pending rescan timer for {self.codebase_name}"
-                    )
 
                 # Schedule the actual rescan trigger after a delay
-                logger.info(
-                    f"Watcher: Scheduling rescan for {self.codebase_name} in {RESCAN_DEBOUNCE_DELAY}s"
-                )
                 self._rescan_timer = self.loop.call_later(
                     RESCAN_DEBOUNCE_DELAY, self._schedule_rescan_coroutine
                 )
@@ -174,40 +172,41 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
             )
             return
         logger.info(
-            f"Watcher: Debounce period ended for {self.codebase_name}. Triggering rescan coroutine."
+            f"Watcher: Debounce period ended for {self.codebase_name}. Triggering rescan coroutine for {len(self.dirty_files)} files."
         )
+
+        # Snapshot dirty files and clear the set
+        files_to_scan = list(self.dirty_files)
+        self.dirty_files.clear()
+
+        if not files_to_scan:
+             return
+
         # Ensure the coroutine is run in the loop the handler was initialized with
-        asyncio.run_coroutine_threadsafe(self._rescan_codebase(), self.loop)
+        asyncio.run_coroutine_threadsafe(self._rescan_codebase(files_to_scan), self.loop)
         self._rescan_timer = None  # Clear the timer handle
 
-    async def _rescan_codebase(self):
-        """Async helper to trigger a rescan of the entire codebase directory. Should be run via run_coroutine_threadsafe."""
-        # Ensure this runs only once per debounce period by checking timer again (belt and suspenders)
-        # This check might be redundant if scheduling logic is perfect, but adds safety.
-        # if self._rescan_timer is not None:
-        #     logger.warning(f"Watcher: _rescan_codebase called while timer still active for {self.codebase_name}. Skipping redundant run.")
-        #     return
-
+    async def _rescan_codebase(self, specific_files: List[str]):
+        """Async helper to trigger a targeted scan."""
         processed_uuids = []
         scan_success = False
         try:
-            logger.info(f"Async rescan task started for {self.codebase_name}")
+            logger.info(f"Async rescan task started for {self.codebase_name} (files: {len(specific_files)})")
             codebase_details = await asyncio.to_thread(
                 self.manager.get_codebase_details, self.codebase_name
             )
             if codebase_details and codebase_details.get("directory"):
                 codebase_dir = codebase_details["directory"]
-                # Instantiate CodeScanner and call its method
-                # Assuming CodeScanner doesn't need the client passed directly anymore if manager handles it
-                scanner = CodeScanner(self.manager)
-                # Capture the result and UUIDs
-                scan_status, processed_uuids = await scanner._scan_cleanup_and_upload(
-                    codebase_dir, tenant_id=self.codebase_name
+
+                # Call scan directly.
+                # Note: _scan_cleanup_and_upload expects 'client' as first arg.
+                # self.manager is the bridge. self.manager.client is the client.
+                scan_status, processed_uuids = await _scan_cleanup_and_upload(
+                    self.manager.client, codebase_dir, tenant_id=self.codebase_name, specific_files=specific_files
                 )
                 logger.info(
                     f"Async rescan task finished for {self.codebase_name}. Status: {scan_status}"
                 )
-                # Check if scan reported success (adjust based on actual return value if needed)
                 scan_success = "ERROR" not in scan_status.upper()
 
             else:
@@ -224,14 +223,11 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 f"Watcher: Queueing {len(processed_uuids)} updated elements for LLM processing in {self.codebase_name}."
             )
             try:
-                # This assumes a method exists on the manager to handle queuing.
-                # The actual implementation of this method would live elsewhere (e.g., weaviate_client.py or mcp_server.py)
-                # and interact with the background processing queue.
                 success = await asyncio.to_thread(
                     self.manager.queue_llm_processing,
                     self.codebase_name,
                     processed_uuids,
-                    skip_enriched=True,  # Usually skip elements already processed unless forced
+                    skip_enriched=True,
                 )
                 if success:
                     logger.info(
@@ -270,7 +266,7 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
 
 
 def watcher_thread_target(
-    manager: WeaviateManager,  # Pass manager instance
+    manager,  # Pass manager instance
     active_watchers_dict: Dict[str, Any],  # Pass the dict to check status
     codebase_name: str,
     directory: str,
@@ -323,13 +319,6 @@ def watcher_thread_target(
                 )
                 break
 
-            # Optional: Could still check registry status periodically via manager if needed for external consistency
-            # details = manager.get_codebase_details(codebase_name) # This would need to be run in thread
-            # if not details or not details.get("watcher_active", False):
-            #     logger.info(f"Watcher thread for '{codebase_name}': watcher_active flag is False in registry. Stopping watcher.")
-            #     stop_event.set() # Signal stop based on registry
-            #     break
-
             logger.debug(
                 f"Watcher thread for '{codebase_name}': Still active, polling again."
             )
@@ -347,7 +336,7 @@ def watcher_thread_target(
 
 
 def start_watcher(
-    manager: WeaviateManager, active_watchers_dict: Dict[str, Any], codebase_name: str
+    manager, active_watchers_dict: Dict[str, Any], codebase_name: str
 ) -> Tuple[bool, str]:
     """
     Starts the file watcher for a given codebase in a separate thread.
@@ -431,7 +420,7 @@ def start_watcher(
 
 
 def stop_watcher(
-    manager: WeaviateManager, active_watchers_dict: Dict[str, Any], codebase_name: str
+    manager, active_watchers_dict: Dict[str, Any], codebase_name: str
 ) -> Tuple[bool, str]:
     """
     Signals a watcher thread to stop, updates the registry, and removes from active_watchers_dict.
