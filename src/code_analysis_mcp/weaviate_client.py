@@ -282,11 +282,11 @@ def get_all_code_files(client, tenant_id: str):
     logger.info(f"Fetching all code files from Weaviate for tenant '{tenant_id}'.")
     try:
         collection = client.collections.get("CodeFile")
-        response = collection.with_tenant(tenant_id).query.fetch_objects(
-            limit=10000, return_properties=["path", "last_modified"]
-        )
         files_data = {}
-        for obj in response.objects:
+        # Use iterator to handle large datasets (pagination)
+        for obj in collection.with_tenant(tenant_id).iterator(
+            return_properties=["path", "last_modified"]
+        ):
             try:
                 stored_datetime = obj.properties["last_modified"]
                 if stored_datetime.tzinfo is None:
@@ -296,8 +296,9 @@ def get_all_code_files(client, tenant_id: str):
                 files_data[obj.properties["path"]] = stored_datetime
             except Exception as parse_e:
                 logger.error(
-                    f"Error processing last_modified for {obj.properties['path']} in tenant '{tenant_id}': {parse_e}. Value: {obj.properties.get('last_modified')}"
+                    f"Error processing last_modified for {obj.properties.get('path')} in tenant '{tenant_id}': {parse_e}. Value: {obj.properties.get('last_modified')}"
                 )
+
         logger.info(f"Fetched {len(files_data)} code files for tenant '{tenant_id}'.")
         logger.debug(
             f"get_all_code_files returning data for tenant '{tenant_id}': {files_data}"

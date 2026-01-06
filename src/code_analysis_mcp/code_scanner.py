@@ -59,29 +59,29 @@ else:
 
 
 # --- Helper Functions ---
-def find_python_files(directory):
-    """Finds all python files recursively in the given directory"""
-
+def _find_python_files_sync(directory):
+    """Sync helper to find python files with basic filtering."""
     assert os.path.isabs(directory), "Directory must be absolute."
 
     python_files = []
     start_dir = os.path.abspath(directory)
-    # Using os.scandir could be slightly faster but os.walk is robust.
-    # For now, sticking to os.walk or checking if we need scandir optimization.
-    # Scenario 1 suggests optimization here, but we are prioritizing critical refactors.
-    # Let's keep synchronous finding for now as it's not the biggest blocker compared to full scan.
-    # Wait, Scenario 1 IS synchronous file walking.
-    # But now we support specific files scanning, which bypasses this for updates.
-    # For initial scan, we can optimize later if needed.
 
-    python_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(start_dir)
-        for f in files
-        if f.endswith(".py")
-    ]
+    # Basic filtering for common non-source directories
+    skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'build', 'dist'}
+
+    for root, dirs, files in os.walk(start_dir):
+        # Modify dirs in-place to skip traversing ignored directories
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+
+        for f in files:
+            if f.endswith(".py"):
+                python_files.append(os.path.join(root, f))
 
     return python_files
+
+async def find_python_files(directory):
+    """Finds all python files recursively in the given directory asynchronously."""
+    return await asyncio.to_thread(_find_python_files_sync, directory)
 
 
 async def read_file_content(abs_path):
@@ -774,7 +774,7 @@ async def _scan_cleanup_and_upload(
         else:
             # Full scan
             stored_files_data = get_all_code_files(client, tenant_id)
-            local_python_files = find_python_files(directory)
+            local_python_files = await find_python_files(directory)
             local_file_paths = set()
             for f in local_python_files:
                  try:
