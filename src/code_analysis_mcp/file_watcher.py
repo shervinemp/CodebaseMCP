@@ -32,26 +32,19 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
     """Triggers analysis when a watched file is modified or created."""
 
     def __init__(
-        self, manager, codebase_name: str, patterns: list[str]
+        self, manager, codebase_name: str, patterns: list[str], loop: asyncio.AbstractEventLoop
     ):
         self.manager = manager  # Store the manager instance
         self.codebase_name = codebase_name
         self.patterns = patterns
+        self.loop = loop
         self.dirty_files: Set[str] = set() # Track files that need scanning
         self.dirty_files_lock = threading.Lock() # Protect access to dirty_files
         self._rescan_timer: asyncio.TimerHandle | None = (
             None  # Timer for debouncing rescans
         )
-        try:
-            # Get the running loop in the thread where the handler is instantiated
-            # This loop belongs to the mcp_server's main thread usually
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # If no loop is running (e.g., in the watcher thread before starting its own loop)
-            self.loop = None
-            logger.warning(
-                "AnalysisTriggerHandler initialized without a running asyncio loop."
-            )
+        if not self.loop:
+            logger.error("AnalysisTriggerHandler initialized without an event loop. Async tasks will fail.")
 
     def _should_process(self, event_path):
         """Check if the event path matches the patterns."""
@@ -174,7 +167,7 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         )
 
     def _schedule_rescan_coroutine(self):
-        """Schedules the _rescan_codebase coroutine to run thread-safely."""
+        """Schedules the _rescan_codebase coroutine to run on the main loop."""
         if not self.loop or not self.loop.is_running():
             logger.error(
                 f"Watcher: Event loop stopped before debounced rescan could run for {self.codebase_name}."
@@ -192,8 +185,8 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         if not files_to_scan:
              return
 
-        # Ensure the coroutine is run in the loop the handler was initialized with
-        asyncio.run_coroutine_threadsafe(self._rescan_codebase(files_to_scan), self.loop)
+        # We are already in the loop callback (via call_later), so use create_task
+        self.loop.create_task(self._rescan_codebase(files_to_scan))
         self._rescan_timer = None  # Clear the timer handle
 
     async def _rescan_codebase(self, specific_files: List[str]):
@@ -281,6 +274,7 @@ def watcher_thread_target(
     codebase_name: str,
     directory: str,
     stop_event: threading.Event,
+    loop: asyncio.AbstractEventLoop, # Pass the main loop
 ):
     """Target function for the watcher thread."""
     logger.info(
@@ -294,17 +288,13 @@ def watcher_thread_target(
         )
         return
 
-    # Create a new event loop for this thread if one doesn't exist
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # We do NOT create a new loop here. We use the passed 'loop' (main loop) for callbacks.
 
     event_handler = AnalysisTriggerHandler(
         manager=manager,  # Pass the manager
         codebase_name=codebase_name,
         patterns=patterns,
+        loop=loop,
     )
     observer = Observer()
     observer.schedule(event_handler, directory, recursive=True)
@@ -346,13 +336,19 @@ def watcher_thread_target(
 
 
 def start_watcher(
-    manager, active_watchers_dict: Dict[str, Any], codebase_name: str
+    manager, active_watchers_dict: Dict[str, Any], codebase_name: str, loop: asyncio.AbstractEventLoop = None
 ) -> Tuple[bool, str]:
     """
     Starts the file watcher for a given codebase in a separate thread.
     Manages the active_watchers_dict provided by the caller.
     """
     logger.info(f"Attempting to start watcher for codebase '{codebase_name}'")
+
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+             logger.warning("start_watcher called without loop and no running loop found. Watcher might fail to schedule tasks.")
 
     if not manager or not manager.client:
         msg = "Cannot start watcher: Weaviate manager/client not available."
@@ -403,6 +399,7 @@ def start_watcher(
                 codebase_name,
                 directory,
                 stop_event,
+                loop,
             ),  # Pass manager and dict
             daemon=True,
         )

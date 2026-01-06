@@ -93,25 +93,7 @@ ACTIVE_WATCHERS: Dict[str, Dict[str, Any]] = {}
 
 
 # --- Background Task Functions ---
-async def process_element_llm(client, uuid: str, tenant_id: str):
-    """Enriches and then refines a single element using LLM calls, with concurrency control."""
-    async with llm_semaphore:
-        logger.debug(f"Starting LLM processing for {uuid} in tenant {tenant_id}")
-        try:
-            if not client or not client.is_connected():
-                logger.error(
-                    f"LLM Task (Tenant: {tenant_id}): Client disconnected for {uuid}. Aborting."
-                )
-                return
-
-            enriched = await enrich_element(client, tenant_id, uuid)
-            if enriched:
-                await refine_element_description(client, tenant_id, uuid)
-            logger.debug(f"Finished LLM processing for {uuid} in tenant {tenant_id}")
-        except Exception as e:
-            logger.error(
-                f"Error during background LLM processing for {uuid} in tenant {tenant_id}: {e}"
-            )
+# process_element_llm removed - superseded by _process_llm_batch
 
 
 async def background_generate_summary(client, codebase_name: str):
@@ -221,8 +203,10 @@ async def start_watcher_wrapper(codebase_name: str) -> tuple[bool, str]:
     if not global_weaviate_client:
          return False, "Weaviate client not initialized"
     manager = WeaviateManagerBridge(global_weaviate_client)
+    # Capture the running loop to pass to the watcher thread
+    loop = asyncio.get_running_loop()
     # start_watcher is synchronous but launches a thread
-    return start_watcher(manager, ACTIVE_WATCHERS, codebase_name)
+    return start_watcher(manager, ACTIVE_WATCHERS, codebase_name, loop=loop)
 
 async def stop_watcher_wrapper(codebase_name: str) -> tuple[bool, str]:
     if not global_weaviate_client:
