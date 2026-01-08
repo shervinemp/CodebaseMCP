@@ -374,32 +374,20 @@ def _shorten_file_path(
     if not file_path or not codebase_root_dir:
         return file_path
 
-    # Fast path: string manipulation if formatting matches
-    if file_path.startswith(codebase_root_dir):
-        start_idx = len(codebase_root_dir)
-        # Case 1: Exact match
-        if len(file_path) == start_idx:
-            return "./"
-        # Case 2: Subdirectory match (must have separator at boundary)
-        if file_path[start_idx] == os.sep:
-            return file_path[start_idx+1:].replace(os.sep, "/")
-        # Case 3: Root dir ends with separator (unlikely with normpath but possible)
-        if codebase_root_dir.endswith(os.sep):
-            return file_path[start_idx:].replace(os.sep, "/")
+    try:
+        # Use os.path.relpath for robust, cross-platform path handling
+        relative_path = os.path.relpath(file_path, start=codebase_root_dir)
 
-        # If none of the above, it's a partial match (e.g. /app matching /app_v2),
-        # so we fall through to robust normalization.
+        # If the file is outside the root (starts with ..), return the absolute path
+        if relative_path.startswith(".."):
+             return os.path.normpath(file_path).replace(os.sep, "/")
 
-    # Fallback to robust normalization
-    abs_path = os.path.normpath(file_path)
-    codebase_root_norm = os.path.normpath(codebase_root_dir)
-
-    if abs_path.startswith(codebase_root_norm):
-        relative_path = os.path.relpath(abs_path, start=codebase_root_norm)
+        # Standardize separators to forward slashes for API output
         final_path = relative_path.replace(os.sep, "/")
         return final_path if final_path != "." else "./"
-    else:
-        return abs_path.replace(os.sep, "/")
+    except ValueError:
+        # Occurs on Windows if paths are on different drives
+        return os.path.normpath(file_path).replace(os.sep, "/")
 
 
 def _trim_string(value: Any) -> Any:
