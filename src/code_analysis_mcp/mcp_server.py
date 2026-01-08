@@ -376,11 +376,19 @@ def _shorten_file_path(
 
     # Fast path: string manipulation if formatting matches
     if file_path.startswith(codebase_root_dir):
-        # +1 for separator if needed
         start_idx = len(codebase_root_dir)
-        if len(file_path) > start_idx and file_path[start_idx] == os.sep:
-            start_idx += 1
-        return file_path[start_idx:].replace(os.sep, "/")
+        # Case 1: Exact match
+        if len(file_path) == start_idx:
+            return "./"
+        # Case 2: Subdirectory match (must have separator at boundary)
+        if file_path[start_idx] == os.sep:
+            return file_path[start_idx+1:].replace(os.sep, "/")
+        # Case 3: Root dir ends with separator (unlikely with normpath but possible)
+        if codebase_root_dir.endswith(os.sep):
+            return file_path[start_idx:].replace(os.sep, "/")
+
+        # If none of the above, it's a partial match (e.g. /app matching /app_v2),
+        # so we fall through to robust normalization.
 
     # Fallback to robust normalization
     abs_path = os.path.normpath(file_path)
