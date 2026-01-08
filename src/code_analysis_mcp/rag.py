@@ -130,8 +130,8 @@ async def answer_codebase_question(
         logger.debug(
             f"answer_codebase_question: Finding relevant elements via semantic search across tenants {tenant_ids_to_query}..."
         )
-        # find_relevant_elements is synchronous, call directly
-        primary_context_elements = find_relevant_elements(
+        # find_relevant_elements is now async
+        primary_context_elements = await find_relevant_elements(
             weaviate_client,
             tenant_ids_to_query,
             query_text,
@@ -337,57 +337,58 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
 
         context_parts = {}
 
-        try:
-            target_with_refs = await asyncio.to_thread(
-                elements_collection.with_tenant(tenant_id).query.fetch_object_by_id,
-                uuid=element_uuid,
-                return_references=[
-                    wvc_query.QueryReference(
-                        link_on="calls_function",
-                        return_properties=["name", "element_type", "llm_description"],
-                    )
-                ],
-            )
-            if target_with_refs and target_with_refs.references:
-                callees = target_with_refs.references.get("calls_function", [])
-                if callees and callees.objects:
-                    context_parts["Callees"] = "\n".join(
+        # Helper functions for parallel fetching
+        async def fetch_callees():
+            try:
+                target_with_refs = await asyncio.to_thread(
+                    elements_collection.with_tenant(tenant_id).query.fetch_object_by_id,
+                    uuid=element_uuid,
+                    return_references=[
+                        wvc_query.QueryReference(
+                            link_on="calls_function",
+                            return_properties=["name", "element_type", "llm_description"],
+                        )
+                    ],
+                )
+                if target_with_refs and target_with_refs.references:
+                    callees = target_with_refs.references.get("calls_function", [])
+                    if callees and callees.objects:
+                        return "Callees", "\n".join(
+                            [
+                                f"- {c.properties.get('name', '?')} ({c.properties.get('element_type', '?')}): {c.properties.get('llm_description', 'No description')}"
+                                for c in callees.objects
+                            ]
+                        )
+            except Exception as ref_e:
+                logger.warning(f"Failed to fetch callees: {ref_e}")
+            return None
+
+        async def fetch_callers():
+            try:
+                response_callers = await asyncio.to_thread(
+                    elements_collection.with_tenant(tenant_id).query.fetch_objects,
+                    filters=wvc_query.Filter.by_ref_count("calls_function").greater_than(0)
+                    & wvc_query.Filter.by_reference("calls_function").contains_any(
+                        [element_uuid]
+                    ),
+                    limit=5,
+                    return_properties=["name", "element_type", "llm_description"],
+                )
+                if response_callers.objects:
+                    return "Callers", "\n".join(
                         [
                             f"- {c.properties.get('name', '?')} ({c.properties.get('element_type', '?')}): {c.properties.get('llm_description', 'No description')}"
-                            for c in callees.objects
+                            for c in response_callers.objects
                         ]
                     )
-        except Exception as ref_e:
-            logger.warning(
-                f"Failed to fetch callees for {element_uuid} in tenant '{tenant_id}': {ref_e}"
-            )
+            except Exception as ref_e:
+                logger.warning(f"Failed to fetch callers: {ref_e}")
+            return None
 
-        try:
-            response_callers = await asyncio.to_thread(
-                elements_collection.with_tenant(tenant_id).query.fetch_objects,
-                filters=wvc_query.Filter.by_ref_count("calls_function").greater_than(0)
-                & wvc_query.Filter.by_reference("calls_function").contains_any(
-                    [element_uuid]
-                ),
-                limit=5,
-                return_properties=["name", "element_type", "llm_description"],
-            )
-            if response_callers.objects:
-                context_parts["Callers"] = "\n".join(
-                    [
-                        f"- {c.properties.get('name', '?')} ({c.properties.get('element_type', '?')}): {c.properties.get('llm_description', 'No description')}"
-                        for c in response_callers.objects
-                    ]
-                )
-        except Exception as ref_e:
-            logger.warning(
-                f"Failed to fetch callers for {element_uuid} in tenant '{tenant_id}': {ref_e}"
-            )
-
-        if target_file:
+        async def fetch_siblings():
+            if not target_file: return None
             try:
-                response_siblings = await asyncio.to_thread(
-                    find_element_by_name,
+                response_siblings = await find_element_by_name(
                     weaviate_client,
                     [tenant_id],
                     file_path=target_file,
@@ -396,74 +397,60 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
                 )
                 siblings = [s for s in response_siblings if str(s.uuid) != element_uuid]
                 if siblings:
-                    context_parts[f"Siblings ({target_type}s) in same file"] = (
-                        "\n".join(
-                            [
-                                f"- {s.properties.get('name', '?')}: {s.properties.get('llm_description', 'No description')}"
-                                for s in siblings
-                            ]
-                        )
+                    return f"Siblings ({target_type}s) in same file", "\n".join(
+                        [
+                            f"- {s.properties.get('name', '?')}: {s.properties.get('llm_description', 'No description')}"
+                            for s in siblings
+                        ]
                     )
             except Exception as sib_e:
-                logger.warning(
-                    f"Failed to fetch siblings for {element_uuid} in {target_file} (tenant '{tenant_id}'): {sib_e}"
-                )
+                logger.warning(f"Failed to fetch siblings: {sib_e}")
+            return None
 
-        try:
-            variables = set(
-                re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b(?!\s*\()", target_code)
-            )
-            common_keywords = {
-                "self",
-                "return",
-                "def",
-                "class",
-                "if",
-                "else",
-                "elif",
-                "for",
-                "while",
-                "try",
-                "except",
-                "finally",
-                "with",
-                "import",
-                "from",
-                "as",
-                "pass",
-                "None",
-                "True",
-                "False",
-            }
-            variables = variables - common_keywords
-            related_vars_context = []
-            if variables:
-                logger.debug(f"Found potential variables: {variables}")
-                for var in list(variables)[:3]:
-                    related_snippets = find_relevant_elements(
-                        weaviate_client,
-                        [tenant_id],
-                        query_text=f"Usage of variable {var}",
-                        limit=2,
-                        distance=0.6,
-                    )
-                    for rel in related_snippets:
-                        if (
-                            str(rel.get("uuid")) != element_uuid
-                            and len(rel["properties"].get("code_snippet", "")) < 200
-                        ):
-                            related_vars_context.append(
-                                f"- Related to '{var}' in {rel['properties'].get('file_path', '?')}:\n  ```python\n{rel['properties'].get('code_snippet', '')}\n  ```"
-                            )
-            if related_vars_context:
-                context_parts["Related Variable Usage"] = "\n".join(
-                    related_vars_context
+        async def fetch_variables():
+            try:
+                variables = set(
+                    re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b(?!\s*\()", target_code)
                 )
+                common_keywords = {
+                    "self", "return", "def", "class", "if", "else", "elif", "for",
+                    "while", "try", "except", "finally", "with", "import", "from",
+                    "as", "pass", "None", "True", "False"
+                }
+                variables = variables - common_keywords
+                related_vars_context = []
+                if variables:
+                    # Parallelize variable searches if possible, or limit to top 3 sequential for now to avoid explosion
+                    for var in list(variables)[:3]:
+                        related_snippets = await find_relevant_elements(
+                            weaviate_client,
+                            [tenant_id],
+                            query_text=f"Usage of variable {var}",
+                            limit=2,
+                            distance=0.6,
+                        )
+                        for rel in related_snippets:
+                            if (
+                                str(rel.get("uuid")) != element_uuid
+                                and len(rel["properties"].get("code_snippet", "")) < 200
+                            ):
+                                related_vars_context.append(
+                                    f"- Related to '{var}' in {rel['properties'].get('file_path', '?')}:\n  ```python\n{rel['properties'].get('code_snippet', '')}\n  ```"
+                                )
+                if related_vars_context:
+                    return "Related Variable Usage", "\n".join(related_vars_context)
+            except Exception as var_e:
+                logger.warning(f"Failed during related variable search: {var_e}")
+            return None
 
-        except Exception as var_e:
-            logger.warning(
-                f"Failed during related variable search for {element_uuid} in tenant '{tenant_id}': {var_e}"
-            )
+        # Execute parallel context fetching
+        results = await asyncio.gather(
+            fetch_callees(), fetch_callers(), fetch_siblings(), fetch_variables()
+        )
+
+        for res in results:
+            if res:
+                context_parts[res[0]] = res[1]
 
         context_summary = ""
         for title, content in context_parts.items():

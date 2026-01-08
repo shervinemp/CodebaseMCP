@@ -12,6 +12,7 @@ from weaviate.exceptions import (
 )
 
 import logging
+import asyncio
 from typing import List
 from dotenv import load_dotenv
 
@@ -350,7 +351,7 @@ def get_code_files_metadata(client, tenant_id: str, file_paths: List[str]):
         return {}
 
 
-def find_element_by_name(
+async def find_element_by_name(
     client,
     tenant_ids: List[str],
     element_name: str | None = None,
@@ -360,8 +361,7 @@ def find_element_by_name(
     element_class="CodeElement",
     limit=10,
 ):
-    """Finds elements by name, file path, element type, and/or parent scope across multiple tenants."""
-    all_results = []
+    """Finds elements by name, file path, element type, and/or parent scope across multiple tenants in parallel."""
     logger.info(
         f"Finding element across tenants {tenant_ids} by name='{element_name}', file_path='{file_path}', element_type='{element_type}', parent_scope='{parent_scope_uuid}', class='{element_class}', limit={limit}"
     )
@@ -388,42 +388,45 @@ def find_element_by_name(
         filters[0] if len(filters) == 1 else wvc_query.Filter.all_of(filters)
     )
 
+    collection = client.collections.get(element_class)
+
+    async def query_single_tenant(tenant_id):
+        try:
+            # Run blocking DB call in thread
+            response = await asyncio.to_thread(
+                collection.with_tenant(tenant_id).query.fetch_objects,
+                limit=limit,
+                filters=combined_filter,
+                return_properties=[
+                    "name",
+                    "element_type",
+                    "file_path",
+                    "start_line",
+                    "end_line",
+                    "code_snippet",
+                    "docstring",
+                    "parameters",
+                    "return_type",
+                    "signature",
+                    "readable_id",
+                    "decorators",
+                    "attribute_accesses",
+                    "parent_scope_uuid",
+                    "llm_description",
+                    "user_clarification",
+                    "base_class_names",
+                ],
+            )
+            for obj in response.objects:
+                obj.properties["_tenant_id"] = tenant_id
+            return response.objects
+        except Exception as tenant_e:
+            logger.error(f"Error querying tenant '{tenant_id}': {tenant_e}")
+            return []
+
     try:
-        collection = client.collections.get(element_class)
-        for tenant_id in tenant_ids:
-            logger.debug(f"Querying tenant: {tenant_id}")
-            try:
-                response = collection.with_tenant(tenant_id).query.fetch_objects(
-                    limit=limit,
-                    filters=combined_filter,
-                    return_properties=[
-                        "name",
-                        "element_type",
-                        "file_path",
-                        "start_line",
-                        "end_line",
-                        "code_snippet",
-                        "docstring",
-                        "parameters",
-                        "return_type",
-                        "signature",
-                        "readable_id",
-                        "decorators",
-                        "attribute_accesses",
-                        "parent_scope_uuid",
-                        "llm_description",
-                        "user_clarification",
-                        "base_class_names",
-                    ],
-                )
-                logger.info(
-                    f"Found {len(response.objects)} elements matching criteria for name='{element_name}' in tenant '{tenant_id}'."
-                )
-                for obj in response.objects:
-                    obj.properties["_tenant_id"] = tenant_id
-                all_results.extend(response.objects)
-            except Exception as tenant_e:
-                logger.error(f"Error querying tenant '{tenant_id}': {tenant_e}")
+        results_list = await asyncio.gather(*[query_single_tenant(tid) for tid in tenant_ids])
+        all_results = [item for sublist in results_list for item in sublist]
 
         logger.info(
             f"Total elements found across tenants {tenant_ids}: {len(all_results)}. Applying limit {limit}."
@@ -755,7 +758,7 @@ def delete_tenant(client, tenant_id: str) -> bool:
 
 
 # --- Semantic Search Function (Tenant Specific) ---
-def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
+async def find_relevant_elements(
     client,
     tenant_ids: List[str],
     query_text: str,
@@ -763,7 +766,7 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
     limit=5,
     distance=0.7,
 ):
-    """Finds relevant elements using vector search based on query text across multiple tenants."""
+    """Finds relevant elements using vector search based on query text across multiple tenants in parallel."""
     logger.info(
         f"Starting find_relevant_elements across tenants {tenant_ids} for query: '{query_text}', class='{element_class}', limit={limit}, distance={distance}"
     )
@@ -772,10 +775,6 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
         logger.debug("find_relevant_elements: Importing google.generativeai...")
         import google.generativeai as genai
         from code_scanner import embedding_model_name
-
-        logger.debug(
-            f"find_relevant_elements: Using embedding model: {embedding_model_name}"
-        )
 
         if not embedding_model_name:
             logger.error("find_relevant_elements: Embedding model name not configured.")
@@ -786,7 +785,9 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
         )
         query_vector = None
         try:
-            query_vector_result = genai.embed_content(
+            # Wrap blocking API call
+            query_vector_result = await asyncio.to_thread(
+                genai.embed_content,
                 model=embedding_model_name,
                 content=query_text,
                 task_type="RETRIEVAL_QUERY",
@@ -803,18 +804,17 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
                 f"find_relevant_elements: Failed to generate query vector for '{query_text}'. Result: {query_vector_result}"
             )
             return []
+
         logger.debug(
             f"find_relevant_elements: Generated query vector (length: {len(query_vector)}). Performing Weaviate search..."
         )
 
-        collection = None
-        response = None
         collection = client.collections.get(element_class)
 
-        for tenant_id in tenant_ids:
-            logger.debug(f"Querying tenant: {tenant_id}")
+        async def query_single_tenant(tenant_id):
             try:
-                response = collection.with_tenant(tenant_id).query.near_vector(
+                response = await asyncio.to_thread(
+                    collection.with_tenant(tenant_id).query.near_vector,
                     near_vector=query_vector,
                     limit=limit,
                     distance=distance,
@@ -837,17 +837,13 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
                         "llm_description",
                         "user_clarification",
                         "base_class_names",
-                    ],
+                    ]
                 )
-                logger.debug(
-                    f"find_relevant_elements: Weaviate near_vector query successful for tenant '{tenant_id}'."
-                )
+
+                results = []
                 if response and response.objects:
-                    logger.debug(
-                        f"find_relevant_elements: Processing {len(response.objects)} results from Weaviate for tenant '{tenant_id}'."
-                    )
                     for obj in response.objects:
-                        all_results.append(
+                        results.append(
                             {
                                 "uuid": str(obj.uuid),
                                 "properties": obj.properties,
@@ -857,14 +853,15 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
                                 "_tenant_id": tenant_id,
                             }
                         )
-                else:
-                    logger.debug(
-                        f"find_relevant_elements: No objects found in Weaviate response for tenant '{tenant_id}'."
-                    )
+                return results
             except Exception as weaviate_e:
                 logger.error(
                     f"find_relevant_elements: Exception during Weaviate near_vector query for tenant '{tenant_id}': {weaviate_e}"
                 )
+                return []
+
+        results_list = await asyncio.gather(*[query_single_tenant(tid) for tid in tenant_ids])
+        all_results = [item for sublist in results_list for item in sublist]
 
         # Sort aggregated results by distance (ascending) and apply overall limit
         all_results.sort(key=lambda x: x.get("distance") or float("inf"))

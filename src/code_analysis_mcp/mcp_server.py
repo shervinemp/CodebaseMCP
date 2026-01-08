@@ -1026,7 +1026,7 @@ async def find_element(
                 )
 
         # Call the multi-tenant version of find_element_by_name
-        results = find_element_by_name(
+        results = await find_element_by_name(
             client,
             tenant_ids_to_query,
             element_name=name,
