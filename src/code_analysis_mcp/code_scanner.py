@@ -22,11 +22,31 @@ from weaviate_client import (  # Use relative import
 from weaviate.util import generate_uuid5
 import logging
 import aiofiles
+import atexit
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 logger.info("Environment variables loaded for code_scanner.")
+
+# --- Shared Executor ---
+_executor = None
+
+def get_shared_executor():
+    """Returns a shared ProcessPoolExecutor."""
+    global _executor
+    if _executor is None:
+        max_workers = os.cpu_count() or 4
+        _executor = ProcessPoolExecutor(max_workers=max_workers)
+    return _executor
+
+def _shutdown_executor():
+    """Clean shutdown for the shared executor."""
+    global _executor
+    if _executor:
+        _executor.shutdown()
+
+atexit.register(_shutdown_executor)
 
 
 # --- Configuration ---
@@ -850,8 +870,8 @@ async def _scan_cleanup_and_upload(
 
         loop = asyncio.get_running_loop()
 
-        # Helper to read file and prep for worker - Executor passed in
-        async def prep_and_run_worker(file_info, executor):
+        # Helper to read file and prep for worker
+        async def prep_and_run_worker(file_info):
             rel_path, abs_path, mtime, status = file_info
             content = await read_file_content(abs_path)
             if content is None:
@@ -868,8 +888,9 @@ async def _scan_cleanup_and_upload(
                 },
             }
 
-            # Run CPU bound task in executor
+            # Run CPU bound task in shared executor
             try:
+                executor = get_shared_executor()
                 elements, references = await loop.run_in_executor(
                     executor, process_file_worker, rel_path, content, file_uuid, mtime
                 )
@@ -878,14 +899,11 @@ async def _scan_cleanup_and_upload(
                 logger.error(f"Error processing file {rel_path}: {e}")
                 return None
 
-        # Create executor once for all tasks
-        max_workers = os.cpu_count() or 4
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Create tasks
-            tasks = [prep_and_run_worker(info, executor) for info in files_to_process]
+        # Create tasks
+        tasks = [prep_and_run_worker(info) for info in files_to_process]
 
-            # Gather results
-            results = await asyncio.gather(*tasks)
+        # Gather results
+        results = await asyncio.gather(*tasks)
 
         for res in results:
             if res:
