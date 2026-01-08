@@ -52,10 +52,11 @@ async def generate_mermaid_call_graph(client=None, start_node_uuid=None) -> str:
 
         # --- Fetch relevant elements ---
         logger.debug("Fetching functions and methods...")
+        # Reduce limit to avoid overwhelming graph visualizers
         response_funcs = await asyncio.to_thread(
             elements_collection.query.fetch_objects,
             filters=wvc_query.Filter.by_property("element_type").equal("function"),
-            limit=1000,
+            limit=200,
             return_properties=["name", "file_path"],
             return_references=[
                 wvc_query.QueryReference(

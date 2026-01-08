@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 
 def create_weaviate_client():
     logger.debug("Attempting to create Weaviate client...")
-    logger.debug("Loading .env variables inside create_weaviate_client...")
-    load_dotenv()
-    logger.debug(".env loaded.")
+    # .env should be loaded at application startup, not here repeatedly.
 
     client = weaviate.connect_to_local()
     logger.info("Weaviate client object created using connect_to_local().")

@@ -134,6 +134,8 @@ class WeaviateManagerBridge:
     """Bridges calls from FileWatcher to the Weaviate client functions."""
     def __init__(self, client):
         self.client = client
+        # Simple cache for tenant checks to avoid roundtrips (Scenario 24)
+        self._tenant_cache = set()
 
     def get_codebase_details(self, codebase_name):
         return get_codebase_details(self.client, codebase_name)
@@ -146,6 +148,14 @@ class WeaviateManagerBridge:
 
     def delete_code_file(self, codebase_name, path):
         return delete_code_file(self.client, codebase_name, path)
+
+    def tenant_exists(self, tenant_id):
+        if tenant_id in self._tenant_cache:
+            return True
+        exists = self.client.collections.get("CodeElement").tenants.exists(tenant_id)
+        if exists:
+            self._tenant_cache.add(tenant_id)
+        return exists
 
     def queue_llm_processing(self, codebase_name, uuids, skip_enriched=True):
         """Adds LLM tasks to the background queue."""
@@ -363,16 +373,24 @@ def _shorten_file_path(
     """Converts an absolute path to a path relative to the codebase root directory."""
     if not file_path or not codebase_root_dir:
         return file_path
+
+    # Fast path: string manipulation if formatting matches
+    if file_path.startswith(codebase_root_dir):
+        # +1 for separator if needed
+        start_idx = len(codebase_root_dir)
+        if len(file_path) > start_idx and file_path[start_idx] == os.sep:
+            start_idx += 1
+        return file_path[start_idx:].replace(os.sep, "/")
+
+    # Fallback to robust normalization
     abs_path = os.path.normpath(file_path)
     codebase_root_norm = os.path.normpath(codebase_root_dir)
+
     if abs_path.startswith(codebase_root_norm):
         relative_path = os.path.relpath(abs_path, start=codebase_root_norm)
         final_path = relative_path.replace(os.sep, "/")
         return final_path if final_path != "." else "./"
     else:
-        logger.debug(
-            f"Path {abs_path} is outside codebase root {codebase_root_norm}. Returning absolute path."
-        )
         return abs_path.replace(os.sep, "/")
 
 
