@@ -150,6 +150,7 @@ class CodeVisitor(ast.NodeVisitor):
         """Initializes the visitor."""
         self.file_path = file_path
         self.code_content = code_content
+        self.code_lines = code_content.splitlines(keepends=True)
         self.file_uuid = file_uuid
         self.elements = []
         self.references = []
@@ -175,6 +176,33 @@ class CodeVisitor(ast.NodeVisitor):
         """Gets the UUID of the immediate parent scope (function/class)."""
         return self.scope_stack[-1][0] if self.scope_stack else None
 
+    def _get_node_source(self, node):
+        """Efficiently extracts source code for a node using line slicing."""
+        if not hasattr(node, 'lineno') or not hasattr(node, 'end_lineno'):
+            return ""
+
+        # AST lines are 1-indexed
+        start_idx = node.lineno - 1
+        end_idx = node.end_lineno - 1
+
+        if start_idx >= len(self.code_lines) or end_idx >= len(self.code_lines):
+            return ""
+
+        if start_idx == end_idx:
+            return self.code_lines[start_idx][node.col_offset:node.end_col_offset]
+
+        # Multi-line
+        lines = []
+        # First line
+        lines.append(self.code_lines[start_idx][node.col_offset:])
+        # Middle lines
+        if end_idx > start_idx + 1:
+            lines.extend(self.code_lines[start_idx + 1:end_idx])
+        # Last line
+        lines.append(self.code_lines[end_idx][:node.end_col_offset])
+
+        return "".join(lines)
+
     def visit_FunctionDef(self, node):
         """Visits FunctionDef nodes (functions and methods)."""
         func_key = self._get_element_key("function", node.name, node.lineno)
@@ -189,9 +217,7 @@ class CodeVisitor(ast.NodeVisitor):
             param_str = arg.arg
             if arg.annotation:
                 try:
-                    annotation_src = ast.get_source_segment(
-                        self.code_content, arg.annotation
-                    )
+                    annotation_src = self._get_node_source(arg.annotation)
                     param_str += f": {annotation_src or ast.unparse(arg.annotation)}"
                 except Exception:
                     param_str += ": ?"
@@ -201,7 +227,7 @@ class CodeVisitor(ast.NodeVisitor):
         return_type_str = ""
         if node.returns:
             try:
-                return_src = ast.get_source_segment(self.code_content, node.returns)
+                return_src = self._get_node_source(node.returns)
                 return_type_str = return_src or ast.unparse(node.returns)
             except Exception:
                 return_type_str = "?"
@@ -217,7 +243,7 @@ class CodeVisitor(ast.NodeVisitor):
             "start_line": node.lineno,
             "end_line": node.end_lineno,
             "docstring": ast.get_docstring(node) or "",
-            "code_snippet": ast.get_source_segment(self.code_content, node) or "",
+            "code_snippet": self._get_node_source(node) or "",
             "parameters": params,
             "return_type": return_type_str,
             "signature": signature,
@@ -290,7 +316,7 @@ class CodeVisitor(ast.NodeVisitor):
             "start_line": node.lineno,
             "end_line": node.end_lineno,
             "docstring": ast.get_docstring(node) or "",
-            "code_snippet": ast.get_source_segment(self.code_content, node) or "",
+                "code_snippet": self._get_node_source(node) or "",
             "readable_id": readable_id,
             "decorators": decorators,
             "parent_scope_uuid": parent_scope_uuid,
@@ -335,7 +361,7 @@ class CodeVisitor(ast.NodeVisitor):
                     "file_path": self.file_path,
                     "start_line": node.lineno,
                     "end_line": node.end_lineno,
-                    "code_snippet": ast.get_source_segment(self.code_content, node)
+                    "code_snippet": self._get_node_source(node)
                     or "",
                     "readable_id": import_key,
                     "parent_scope_uuid": self._get_parent_scope_uuid(),
@@ -371,7 +397,7 @@ class CodeVisitor(ast.NodeVisitor):
                     "file_path": self.file_path,
                     "start_line": node.lineno,
                     "end_line": node.end_lineno,
-                    "code_snippet": ast.get_source_segment(self.code_content, node)
+                    "code_snippet": self._get_node_source(node)
                     or "",
                     "readable_id": import_key,
                     "parent_scope_uuid": self._get_parent_scope_uuid(),
@@ -412,7 +438,7 @@ class CodeVisitor(ast.NodeVisitor):
                     "file_path": self.file_path,
                     "start_line": node.lineno,
                     "end_line": node.end_lineno,
-                    "code_snippet": ast.get_source_segment(self.code_content, node)
+                    "code_snippet": self._get_node_source(node)
                     or "",
                     "readable_id": call_key,
                     "parent_scope_uuid": parent_scope_uuid,
@@ -463,7 +489,7 @@ class CodeVisitor(ast.NodeVisitor):
                         "file_path": self.file_path,
                         "start_line": node.lineno,
                         "end_line": node.end_lineno,
-                        "code_snippet": ast.get_source_segment(self.code_content, node)
+                        "code_snippet": self._get_node_source(node)
                         or "",
                         "readable_id": assign_key,
                         "parent_scope_uuid": parent_scope_uuid,
