@@ -510,7 +510,7 @@ def add_codebase_registry_entry(
     try:
         logger.debug("Getting CodebaseRegistry collection...")
         collection = client.collections.get("CodebaseRegistry")
-        logger.debug(f"Preparing entry data for {codebase_name}...")
+        logger.debug("Preparing entry data for %s...", codebase_name)
         entry_data = {
             "codebase_name": codebase_name,
             "directory": directory,
@@ -520,17 +520,17 @@ def add_codebase_registry_entry(
             "watcher_active": False,
             "dependencies": dependencies or [],
         }
-        logger.debug(f"Attempting insert for {codebase_name}...")
+        logger.debug("Attempting insert for %s...", codebase_name)
         result = collection.data.insert(properties=entry_data)
         logger.debug(
-            f"Insert call completed for {codebase_name}. Result type: {type(result)}"
+            "Insert call completed for %s. Result type: %s", codebase_name, type(result)
         )
         # The result object *is* the UUID, just convert it directly.
         result_uuid_str = str(result)
         logger.info(
             f"Successfully added codebase '{codebase_name}' with UUID {result_uuid_str}."
         )
-        logger.debug(f"add_codebase_registry_entry returning UUID: {result_uuid_str}")
+        logger.debug("add_codebase_registry_entry returning UUID: %s", result_uuid_str)
         return result_uuid_str
     except Exception as e:
         logger.exception(

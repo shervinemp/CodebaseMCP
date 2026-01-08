@@ -560,7 +560,7 @@ def _extract_identifiers(code_snippet: str) -> list[str]:
             "from",
         ]
         identifiers = [i for i in identifiers if i not in keywords]
-        logger.debug(f"Extracted identifiers: {identifiers}")
+        logger.debug("Extracted identifiers: %s", identifiers)
         return identifiers
     except Exception as e:
         logger.error(f"Error extracting identifiers: {type(e).__name__}: {e}")
@@ -578,10 +578,10 @@ async def enrich_elements_batch(client, tenant_id: str, element_uuids: list[str]
     and updates them in Weaviate using batch operations.
     """
     if not GENERATE_LLM_DESCRIPTIONS or not model or not embedding_model_name:
-        logger.debug(f"LLM generation disabled, skipping enrichment for {len(element_uuids)} elements.")
+        logger.debug("LLM generation disabled, skipping enrichment for %d elements.", len(element_uuids))
         return {"success_count": 0, "failed_count": 0}
 
-    logger.info(f"Starting batch enrichment for {len(element_uuids)} elements in tenant {tenant_id}")
+    logger.info("Starting batch enrichment for %d elements in tenant %s", len(element_uuids), tenant_id)
 
     # 1. Fetch all elements details
     elements_to_process = []
@@ -872,7 +872,7 @@ async def _scan_cleanup_and_upload(
                     files_skipped_count += 1
 
                 logger.debug(
-                    f"--- DEBUG SCAN LOOP: '{relative_file_path_for_lookup}': {comparison_result}"
+                    "--- DEBUG SCAN LOOP: '%s': %s", relative_file_path_for_lookup, comparison_result
                 )
 
             except FileNotFoundError:
@@ -887,7 +887,7 @@ async def _scan_cleanup_and_upload(
                 comparison_result = f"ERROR_exception:_{e}"
 
         logger.debug("--- Finished file comparison loop ---")
-        logger.debug(f"Files marked for processing: {len(files_to_process)}")
+        logger.debug("Files marked for processing: %d", len(files_to_process))
 
         files_to_clear = set(files_to_delete_elements_for + files_to_delete_completely)
 

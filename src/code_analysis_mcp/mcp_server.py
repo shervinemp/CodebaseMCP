@@ -407,9 +407,10 @@ async def _process_element_properties(
 ) -> dict[str, Any]:
     """Cleans, filters, and enhances properties for API output, tailored by view_type."""
     logger.debug(
-        f"_process_element_properties START for tenant {tenant_id}, uuid {uuid}, view_type {view_type}, root={codebase_root_dir}"  # Updated log
+        "_process_element_properties START for tenant %s, uuid %s, view_type %s, root=%s",
+        tenant_id, uuid, view_type, codebase_root_dir
     )
-    logger.debug(f"  Input properties: {properties}")
+    logger.debug("  Input properties: %s", properties)
 
     if not properties:
         logger.debug("_process_element_properties END (empty input)")
@@ -480,8 +481,8 @@ async def _process_element_properties(
     if view_type == "list" and "description" not in processed:
         processed["description"] = None
 
-    logger.debug(f"  Processed properties: {processed}")
-    logger.debug(f"_process_element_properties END for tenant {tenant_id}, uuid {uuid}")
+    logger.debug("  Processed properties: %s", processed)
+    logger.debug("_process_element_properties END for tenant %s, uuid %s", tenant_id, uuid)
     return processed
 
 
@@ -528,7 +529,7 @@ def _extract_identifiers(code_snippet: str) -> list[str]:
         "cls",
     }
     filtered_identifiers = list(identifiers - keywords)
-    logger.debug(f"Extracted identifiers using AST: {filtered_identifiers}")
+    logger.debug("Extracted identifiers using AST: %s", filtered_identifiers)
     return filtered_identifiers
 
 
@@ -1192,7 +1193,7 @@ async def analyze_snippet(
                 "related_elements": [],
             }
 
-        logger.debug(f"Found identifiers: {identifiers}")
+        logger.debug("Found identifiers: %s", identifiers)
 
         unique_elements = {}
         errors = []

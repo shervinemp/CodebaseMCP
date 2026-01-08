@@ -238,7 +238,7 @@ async def answer_codebase_question(
             "ANSWER:"
         )
 
-        logger.debug(f"--- RAG Prompt ---\n{prompt}\n------------------")
+        logger.debug("--- RAG Prompt ---\n%s\n------------------", prompt)
 
         # 5. Call generative LLM
         logger.debug("answer_codebase_question: Generating answer with LLM...")
@@ -586,7 +586,7 @@ async def generate_codebase_summary(client, codebase_name: str) -> str:
             return f"Error: Codebase '{codebase_name}' not found."
 
         # Fetch top-level functions and classes (adjust filters as needed) (wrap sync call)
-        logger.debug(f"Fetching key elements for codebase summary: {codebase_name}")
+        logger.debug("Fetching key elements for codebase summary: %s", codebase_name)
         response = await asyncio.to_thread(
             elements_collection.with_tenant(codebase_name).query.fetch_objects,
             filters=(
