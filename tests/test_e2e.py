@@ -1,10 +1,12 @@
 """Full end-to-end test: scan CodebaseMCP, enrich, ask questions."""
 
 # ruff: noqa: E402
+import os
 import sys
 import asyncio
 
-sys.path.insert(0, r"C:\Users\sherv\Desktop\Projects\CodebaseMCP")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,7 +27,7 @@ from src.code_analysis_mcp.rag import (
 from src.code_analysis_mcp.mcp_server import process_element_llm
 
 TENANT = "codebasemcp"
-ROOT = r"C:\Users\sherv\Desktop\Projects\CodebaseMCP"
+ROOT = PROJECT_ROOT
 
 
 async def main():
