@@ -107,6 +107,80 @@ ACTIVE_CODEBASE_NAME: str | None = None
 ACTIVE_WATCHERS: Dict[str, Dict[str, Any]] = {}
 
 
+# --- Topological Sort for DAG-Ordered Enrichment ---
+
+
+async def _topological_sort_uuids(
+    client, tenant_id: str, uuids: list[str]
+) -> list[str]:
+    """
+    Returns UUIDs sorted so callees are enriched before their callers.
+    Non-function elements (imports, variables, calls) go first,
+    then leaf functions, then their callers, up the call chain.
+    This makes refine_element_description see real descriptions for callees.
+    """
+    import weaviate.classes.query as wvc_query
+
+    collection = client.collections.get("CodeElement")
+    response = await asyncio.to_thread(
+        collection.with_tenant(tenant_id).query.fetch_objects,
+        filters=wvc_query.Filter.by_property("element_type").contains_any(
+            ["function", "class"]
+        ),
+        limit=10000,
+        return_references=[
+            wvc_query.QueryReference(
+                link_on="calls_function",
+                return_properties=["name"],
+            )
+        ],
+        return_properties=["name", "element_type"],
+    )
+
+    graph: dict[str, list[str]] = {}
+    func_uuids: set[str] = set()
+    for obj in response.objects:
+        uid = str(obj.uuid)
+        func_uuids.add(uid)
+        graph.setdefault(uid, [])
+        refs = obj.references or {}
+        if "calls_function" in refs:
+            for ref in refs["calls_function"].objects:
+                graph[uid].append(str(ref.uuid))
+
+    in_degree = {u: 0 for u in func_uuids}
+    for caller, callees in graph.items():
+        for callee in callees:
+            if callee in in_degree:
+                in_degree[callee] += 1
+
+    queue = [u for u in func_uuids if in_degree.get(u, 0) == 0]
+    sorted_funcs: list[str] = []
+    visited: set[str] = set()
+    while queue:
+        node = queue.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        sorted_funcs.append(node)
+        for callee in graph.get(node, []):
+            if callee in in_degree:
+                in_degree[callee] -= 1
+                if in_degree[callee] == 0:
+                    queue.append(callee)
+
+    remaining = [u for u in func_uuids if u not in sorted_funcs]
+    sorted_funcs.extend(remaining)
+
+    uuid_set = set(uuids)
+    non_funcs = [u for u in uuids if u not in func_uuids]
+    result = non_funcs + [u for u in sorted_funcs if u in uuid_set]
+    logger.info(
+        f"Topological sort: {len(non_funcs)} non-function + {len(sorted_funcs)} function/class elements"
+    )
+    return result
+
+
 # --- Background Task Functions ---
 async def process_element_llm(client, uuid: str, tenant_id: str):
     """Enriches and then refines a single element using LLM calls, with concurrency control."""
@@ -252,12 +326,9 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                             logger.info(
                                 f"Watcher: Scheduling LLM enrichment for {len(processed_uuids)} elements in '{self.codebase_name}'"
                             )
-                            for uuid in processed_uuids:
-                                self._fire_and_forget(
-                                    process_element_llm(
-                                        self.client, uuid, self.codebase_name
-                                    )
-                                )
+                            self._fire_and_forget(
+                                self._dag_sort_and_enrich(processed_uuids)
+                            )
                 else:
                     logger.error(
                         f"Watcher: Could not get codebase directory for '{self.codebase_name}' to trigger scan."
@@ -267,6 +338,19 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
             logger.error(
                 f"Watcher: Error processing event for {path} in codebase '{self.codebase_name}': {e}"
             )
+
+    async def _dag_sort_and_enrich(self, uuids: list[str]):
+        """DAG-sort UUIDs then enrich in topological order."""
+        sorted_uuids = await _topological_sort_uuids(
+            self.client, self.codebase_name, uuids
+        )
+        for uuid in sorted_uuids:
+            try:
+                await process_element_llm(self.client, uuid, self.codebase_name)
+            except Exception as e:
+                logger.error(
+                    f"Watcher enrich failed for {uuid} in '{self.codebase_name}': {e}"
+                )
 
     def on_modified(self, event: FileModifiedEvent):
         self.process(event)
@@ -925,18 +1009,22 @@ async def scan_codebase(
 
         llm_tasks_started = 0
         if LLM_ENABLED and processed_uuids:
-            llm_tasks_started = len(processed_uuids)
-            logger.info(
-                f"Scheduling {llm_tasks_started} elements for LLM processing in tenant '{tenant_id}'."
+            sorted_uuids = await _topological_sort_uuids(
+                client, tenant_id, processed_uuids
             )
-            for uuid in processed_uuids:
+            llm_tasks_started = len(sorted_uuids)
+            logger.info(
+                f"Scheduling {llm_tasks_started} elements for DAG-ordered LLM processing in tenant '{tenant_id}'."
+            )
+            for uuid in sorted_uuids:
                 llm_task = asyncio.create_task(
                     process_element_llm(client, uuid, tenant_id)
                 )
                 background_llm_tasks.add(llm_task)
                 llm_task.add_done_callback(background_llm_tasks.discard)
             final_message += (
-                f" Background LLM enrichment started for {llm_tasks_started} elements."
+                f" Background LLM enrichment started for {llm_tasks_started} elements "
+                f"(DAG-ordered: callees before callers)."
             )
         elif not LLM_ENABLED:
             final_message += " LLM enrichment disabled."

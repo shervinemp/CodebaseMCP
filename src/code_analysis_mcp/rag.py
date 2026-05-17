@@ -107,16 +107,15 @@ async def answer_codebase_question(
             logger.error(f"Error fetching dependencies for RAG query: {dep_e}")
         # --- End Dependency Handling ---
 
-        # 1. Find relevant context using semantic search across tenants
+        # 1. Find relevant context using hybrid search across tenants
         logger.debug(
-            f"answer_codebase_question: Finding relevant elements via semantic search across tenants {tenant_ids_to_query}..."
+            f"answer_codebase_question: Finding relevant elements via hybrid search across tenants {tenant_ids_to_query}..."
         )
-        # find_relevant_elements is synchronous, call directly
         primary_context_elements = find_relevant_elements(
             weaviate_client,
             tenant_ids_to_query,
             query_text,
-            limit=5,  # Increased limit slightly for multi-tenant
+            limit=10,
         )
         if not primary_context_elements:
             logger.warning(
@@ -191,16 +190,22 @@ async def answer_codebase_question(
                 )
 
         # 3. Format enhanced context for prompt
+        def _clean_desc(elem: dict) -> str:
+            desc = (elem.get("llm_description") or "").strip()
+            if desc in ("", "[Description not generated]"):
+                desc = (elem.get("docstring") or "").strip()
+            return desc
+
         context_str = "\n\n---\n\n".join(
             [
-                f"Source Codebase: {elem.get('_codebase_source', tenant_id)}\n"  # Show source codebase
+                f"Source Codebase: {elem.get('_codebase_source', tenant_id)}\n"
                 f"Relation: {elem.get('relation_type', 'Primary Match')}\n"
                 f"File: {elem.get('file_path', 'N/A')}\n"
                 f"Type: {elem.get('element_type', 'N/A')}\n"
                 f"Name: {elem.get('name', 'N/A')}\n"
-                f"Description: {elem.get('llm_description', '').strip()}\n"
+                f"Description: {_clean_desc(elem)}\n"
                 f"Code Snippet:\n```python\n{elem.get('code_snippet', '').strip()}\n```"
-                for elem in enhanced_context[:7]  # Limit context size
+                for elem in enhanced_context[:10]
             ]
         )
 
