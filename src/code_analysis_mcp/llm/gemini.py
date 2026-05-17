@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class GeminiProvider(LLMProvider):
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
         self._model = None
         self._embedding_model_name = None
 

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class OpenAIProvider(LLMProvider):
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
         self._client = None
         self._model_name = None
         self._embedding_model_name = None

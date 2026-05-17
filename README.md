@@ -38,43 +38,34 @@ This system analyzes Python code using Abstract Syntax Trees (AST), stores the e
 4. **API Key & Configuration:** Create a `.env` file in the project root and add your LLM provider API key. You can also configure other settings:
 
     ```dotenv
-    # --- LLM Provider Selection ---
-    # Choose "gemini" (default) or "openai"
-    # LLM_PROVIDER=gemini
+    # --- LLM Provider ---
+    # LLM_PROVIDER=gemini       # "gemini" (default) or "openai"
+    # LLM_API_KEY=your_key_here  # Generic — works for any provider
 
-    # --- Required (for your chosen provider) ---
-    # For Gemini:
-    GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
-    # For OpenAI:
-    # OPENAI_API_KEY=YOUR_OPENAI_API_KEY_HERE
+    # Or use provider-specific keys (alternative to LLM_API_KEY):
+    # GEMINI_API_KEY=your_gemini_key_here
+    # OPENAI_API_KEY=your_openai_key_here
 
-    # --- Optional ---
-    # Set to true to enable background LLM description generation and refinement
-    GENERATE_LLM_DESCRIPTIONS=true
-    # Max concurrent background LLM tasks (embeddings/descriptions/refinements)
-    LLM_CONCURRENCY=5
-    # ANALYZE_ON_STARTUP is no longer used. Scanning is done via the scan_codebase tool.
+    # --- LLM Features ---
+    GENERATE_LLM_DESCRIPTIONS=true   # Enable LLM descriptions & RAG
+    # LLM_CONCURRENCY=5
 
-    # Specify Weaviate connection details if not using defaults
+    # --- Models ---
+    # Gemini: GENERATION_MODEL_NAME="models/gemini-2.0-flash-001"
+    # OpenAI: GENERATION_MODEL_NAME="gpt-4o"
+
+    # Gemini: EMBEDDING_MODEL_NAME="models/embedding-001"
+    # OpenAI: EMBEDDING_MODEL_NAME="text-embedding-3-small"
+
+    # --- Weaviate ---
     # WEAVIATE_HOST=localhost
     # WEAVIATE_PORT=8080
     # WEAVIATE_GRPC_PORT=50051
 
-    # Specify alternative models if desired
-    # Gemini: GENERATION_MODEL_NAME="models/gemini-2.0-flash-001"
-    # OpenAI: GENERATION_MODEL_NAME="gpt-4o"
-    # GENERATION_MODEL_NAME=...
-
-    # Gemini: EMBEDDING_MODEL_NAME="models/embedding-001"
-    # OpenAI: EMBEDDING_MODEL_NAME="text-embedding-3-small"
-    # EMBEDDING_MODEL_NAME=...
-
-    # Adjust Weaviate batch size
+    # --- Advanced ---
     # WEAVIATE_BATCH_SIZE=100
-
     # SEMANTIC_SEARCH_LIMIT=5
     # SEMANTIC_SEARCH_DISTANCE=0.7
-    # Watcher polling interval (seconds)
     # WATCHER_POLLING_INTERVAL=5
     ```
 
