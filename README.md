@@ -1,53 +1,44 @@
 # CodebaseMCP
 
-MCP server that scans Python codebases with AST, stores them in Weaviate, and answers questions about them via pluggable LLM providers (Gemini, OpenAI).
+MCP server that scans Python codebases with AST, stores them in Weaviate, and answers questions via pluggable LLM providers (Gemini, OpenAI).
 
 ## Quickstart
 
 ```bash
-# 1. Start Weaviate
 docker-compose up -d
-
-# 2. Install deps
 pip install -r requirements.txt
-
-# 3. Create .env (gitignored) with your API key
-echo "LLM_API_KEY=your_key_here" >> .env
+echo "LLM_API_KEY=your_key" >> .env
 echo "GENERATE_LLM_DESCRIPTIONS=true" >> .env
-
-# 4. Run server
 python src/code_analysis_mcp/mcp_server.py
 ```
 
-Then connect via any MCP client and call `scan_codebase` with a project path.
+Call `scan_codebase` from any MCP client with a project path.
 
 ## Features
 
-- **AST scanning** — extracts functions, classes, imports, calls, variables, decorators, signatures, docstrings, and cross-references from Python files.
-- **Vector search** — stores everything in Weaviate with multi-tenant isolation. Search by name, type, file, or semantic similarity.
-- **LLM enrichment** — generates descriptions and embeddings for every function/class. Refines them using caller/callee/sibling context.
-- **RAG Q&A** — `ask_question` answers natural language questions by retrieving relevant code + synthesising with an LLM.
-- **File watching** — automatically rescans and re-enriches on file changes.
-- **Codebase dependencies** — declare relationships between codebases; queries can span dependencies.
-- **Call graph visualization** — generates MermaidJS `graph TD` from stored cross-references.
-- **MCP tools** — all features exposed as MCP tools with pydantic-validated arguments.
+- **AST scanning** — functions, classes, imports, calls, variables, decorators, signatures, docstrings, cross-references.
+- **Hybrid search** — Weaviate vector + BM25 keyword search. Unenriched elements are still findable by name/code content.
+- **DAG-ordered enrichment** — callees enriched before callers, so refinement sees real callee descriptions.
+- **RAG Q&A** — `ask_question` retrieves relevant code via hybrid search and synthesises answers with an LLM.
+- **File watching** — rescans and re-enriches on file changes, DAG-ordered.
+- **Worker pool** — enrichment uses `LLM_CONCURRENCY` workers with a queue instead of N asyncio tasks.
+- **Codebase dependencies** — relationships between codebases; queries span dependencies in parallel.
+- **Call graph visualization** — MermaidJS from stored cross-references.
 
 ## Configuration
 
-Create a `.env` file in the project root (it is gitignored):
-
 ```dotenv
-LLM_PROVIDER=gemini
-LLM_API_KEY=
-GENERATE_LLM_DESCRIPTIONS=true
+LLM_PROVIDER=gemini                     # or "openai"
+LLM_API_KEY=                            # generic key for any provider
+GENERATE_LLM_DESCRIPTIONS=true          # enables enrichment, refinement, RAG
 
-LLM_CONCURRENCY=5
+LLM_CONCURRENCY=5                       # worker pool size
 GENERATION_MODEL_NAME=models/gemini-3.1-flash-lite-preview
 EMBEDDING_MODEL_NAME=models/gemini-embedding-2
-WEAVIATE_HOST=localhost
+WEAVIATE_HOST=localhost                 # these 3 env vars are now functional
 WEAVIATE_PORT=8080
 WEAVIATE_GRPC_PORT=50051
-SEMANTIC_SEARCH_LIMIT=5
+SEMANTIC_SEARCH_LIMIT=10
 SEMANTIC_SEARCH_DISTANCE=0.7
 WATCHER_POLLING_INTERVAL=5
 ```
@@ -57,13 +48,14 @@ WATCHER_POLLING_INTERVAL=5
 ```
 src/code_analysis_mcp/
 ├── llm/                  # Pluggable LLM providers
-│   ├── base.py           #   LLMProvider ABC (implement to add a provider)
+│   ├── base.py           #   ABC: implement generate() + embed()
 │   ├── gemini.py         #   GeminiProvider
 │   ├── openai.py         #   OpenAIProvider
-│   └── factory.py        #   Provider factory + singleton
-├── code_scanner.py       # AST parsing, element extraction, enrichment
-├── weaviate_client.py    # Schema, CRUD, semantic search
+│   └── factory.py        #   Factory + singleton, reads LLM_PROVIDER
+├── code_scanner.py       # AST parsing, element extraction, upload
+├── weaviate_client.py    # Schema, CRUD, hybrid search
 ├── rag.py                # RAG Q&A, description refinement, summaries
+├── tasks.py              # Enrichment workers, DAG sort, summary (extracted from mcp_server)
 ├── mcp_server.py         # FastMCP server, tools, watcher, lifespan
 ├── visualization.py      # MermaidJS call graphs
 └── utils.py              # Shared helpers
@@ -71,34 +63,29 @@ src/code_analysis_mcp/
 
 ### LLM provider system
 
-Add a new provider by:
-1. Creating a class in `llm/` that implements `LLMProvider` (generate + embed + name + is_available)
-2. Adding it to the factory in `llm/factory.py`
-
-The provider is selected at startup via `LLM_PROVIDER`. The API key is read from `LLM_API_KEY` (generic) or the provider-specific fallback (`GEMINI_API_KEY`, `OPENAI_API_KEY`).
+New providers implement the `LLMProvider` ABC in `llm/base.py` and register in `llm/factory.py`. Key selected via `LLM_API_KEY` (generic) or `GEMINI_API_KEY` / `OPENAI_API_KEY` (fallback).
 
 ### Data model
 
-Weaviate uses three collections:
-- **CodeFile** (multi-tenant) — file paths and modification times.
-- **CodeElement** (multi-tenant) — every parsed function, class, import, call, and variable assignment, with optional LLM-generated vector embeddings.
-- **CodebaseRegistry** (global) — tracks codebase names, directories, scan status, summaries, watcher status, and dependency lists.
+- **CodeFile** (multi-tenant) — file paths, modification times.
+- **CodeElement** (multi-tenant) — every parsed element with optional vector.
+- **CodebaseRegistry** (global) — codebase metadata, status, dependencies.
 
-Each codebase is isolated in its own tenant (tenant ID = codebase name). Cross-codebase queries look up declared dependencies in the registry and fan out across tenants.
+Tenant ID = codebase name. Cross-codebase queries fan out across dependency tenants.
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `scan_codebase` | Scan a directory, upload to Weaviate, generate summary, start watcher |
-| `list_codebases` | List all registered codebases and their status |
-| `select_codebase` | Set the active codebase for subsequent queries |
-| `delete_codebase` | Remove a codebase from Weaviate and the registry |
-| `find_element` | Search elements by name, file, type across active + dependencies |
-| `get_details` | Full properties for a specific element UUID |
-| `analyze_snippet` | Find elements related to a code snippet via identifier matching |
-| `ask_question` | RAG question answering against the active codebase |
-| `trigger_llm_processing` | Manually queue elements for LLM enrichment |
-| `regenerate_summary` | Re-run summary generation for the active codebase |
-| `start_watcher` / `stop_watcher` | Control file watching manually |
-| `add_codebase_dependency` / `remove_codebase_dependency` | Manage dependency graph |
+| `scan_codebase` | Scan, upload, DAG-enrich, summarise, start watcher |
+| `list_codebases` | Registered codebases with status |
+| `select_codebase` | Set active context (stops prior watcher) |
+| `delete_codebase` | Remove codebase + tenant + registry entry |
+| `find_element` | Search by name, file, type across active + dependencies |
+| `get_details` | Full properties for a UUID |
+| `analyze_snippet` | Find elements related to a code snippet |
+| `ask_question` | RAG (with optional `include_dependencies`) |
+| `trigger_llm_processing` | Queue enrichment (DAG-ordered, worker pool) |
+| `regenerate_summary` | Re-run summary without rescanning |
+| `start_watcher` / `stop_watcher` | Manual watcher control |
+| `add_codebase_dependency` / `remove_codebase_dependency` | Dependency graph management |
