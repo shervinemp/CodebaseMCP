@@ -21,7 +21,7 @@ model_name = os.getenv(
 )
                 self._model = genai.GenerativeModel(model_name)
 self._embedding_model_name = os.getenv(
-    "EMBEDDING_MODEL_NAME", "models/gemini-embedding-001"
+    "EMBEDDING_MODEL_NAME", "models/gemini-embedding-2"
 )
                 logger.info(
                     f"GeminiProvider: generation={model_name}, embedding={self._embedding_model_name}"
