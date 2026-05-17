@@ -180,11 +180,11 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         return any(event_path.endswith(p.strip("*")) for p in self.patterns)
 
     def _run_async_task(self, coro):
-        """Safely run an async task from a sync handler thread."""
+        """Run an async task from a sync handler thread and return its result."""
         if self.loop and self.loop.is_running():
             future = asyncio.run_coroutine_threadsafe(coro, self.loop)
             try:
-                future.result(timeout=60)
+                return future.result(timeout=180)
             except TimeoutError:
                 logger.error(
                     f"Watcher: Async task timed out for codebase {self.codebase_name}"
@@ -195,14 +195,20 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 )
         else:
             try:
-                asyncio.run(coro)
+                return asyncio.run(coro)
             except Exception as e:
                 logger.error(
                     f"Watcher: Async task failed (new loop) for codebase {self.codebase_name}: {e}"
                 )
+        return None
+
+    def _fire_and_forget(self, coro):
+        """Schedule an async task without waiting for completion."""
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     def process(self, event):
-        """Process file system event: Scan and Upload for the specific codebase."""
+        """Process file system event: Scan, Upload, and enrich for the specific codebase."""
         if event.is_directory or not self._should_process(event.src_path):
             return
 
@@ -235,11 +241,23 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                 codebase_details = get_codebase_details(self.client, self.codebase_name)
                 if codebase_details and codebase_details.get("directory"):
                     codebase_dir = codebase_details["directory"]
-                    self._run_async_task(
+                    result = self._run_async_task(
                         _scan_cleanup_and_upload(
                             self.client, codebase_dir, tenant_id=self.codebase_name
                         )
                     )
+                    if result and LLM_ENABLED:
+                        _, processed_uuids = result
+                        if processed_uuids:
+                            logger.info(
+                                f"Watcher: Scheduling LLM enrichment for {len(processed_uuids)} elements in '{self.codebase_name}'"
+                            )
+                            for uuid in processed_uuids:
+                                self._fire_and_forget(
+                                    process_element_llm(
+                                        self.client, uuid, self.codebase_name
+                                    )
+                                )
                 else:
                     logger.error(
                         f"Watcher: Could not get codebase directory for '{self.codebase_name}' to trigger scan."
@@ -1477,6 +1495,38 @@ async def ask_question(
             "status": "error",
             "message": f"Failed to answer question about codebase '{tenant_id}': {e}",
         }
+
+
+@mcp.tool(
+    name="regenerate_summary",
+    description="Regenerates the LLM summary for the active codebase.",
+)
+async def regenerate_summary():
+    """Regenerates the codebase summary for the active codebase."""
+    logger.info("--- regenerate_summary tool execution START ---")
+    if not ACTIVE_CODEBASE_NAME:
+        return {
+            "status": "error",
+            "message": "No active codebase selected. Use 'select_codebase' first.",
+        }
+    if not LLM_ENABLED:
+        return {"status": "error", "message": "LLM processing is disabled."}
+
+    client = global_weaviate_client
+    if not client or not client.is_connected():
+        return {"status": "error", "message": "Weaviate client not connected."}
+
+    tenant_id = ACTIVE_CODEBASE_NAME
+    logger.info(f"Regenerating summary for codebase '{tenant_id}'")
+    try:
+        summary = await generate_codebase_summary(client, tenant_id)
+        if summary.startswith("Error"):
+            return {"status": "error", "message": summary}
+        update_codebase_registry(client, tenant_id, {"summary": summary})
+        return {"status": "success", "summary": summary}
+    except Exception as e:
+        logger.exception(f"Error regenerating summary for '{tenant_id}': {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool(
