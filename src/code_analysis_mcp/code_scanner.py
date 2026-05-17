@@ -653,10 +653,7 @@ async def _scan_cleanup_and_upload(
             current_mtime_dt = None
             stored_mtime_dt = None
             comparison_result = "ERROR_before_comparison"
-            project_root = "c:/Users/sherv/Desktop/Projects/ragcode"
-            abs_file_path_for_mtime = os.path.abspath(
-                os.path.join(project_root, file_path)
-            )
+            abs_file_path_for_mtime = os.path.abspath(file_path)
             relative_file_path_for_lookup = file_path
 
             try:

@@ -52,7 +52,7 @@ def create_schema(client):
                 name=codefile_class_name,
                 description="Represents a code file",
                 multi_tenancy_config=Configure.multi_tenancy(enabled=True),
-                vectorizer_config=Configure.Vectorizer.none(),
+                vector_config=Configure.Vectorizer.none(),
                 properties=[
                     Property(
                         name="path",
@@ -88,7 +88,7 @@ def create_schema(client):
             collections.create(
                 name=codeelement_class_name,
                 description="Represents a code element (function, class, variable, import, call, etc.)",
-                vectorizer_config=Configure.Vectorizer.none(),
+                vector_config=Configure.Vectorizer.none(),
                 properties=[
                     Property(name="name", data_type=DataType.TEXT),
                     Property(name="element_type", data_type=DataType.TEXT),
@@ -161,7 +161,7 @@ def create_schema(client):
             collections.create(
                 name=codebaseregistry_class_name,
                 description="Tracks scanned codebases and their status",
-                vectorizer_config=Configure.Vectorizer.none(),
+                vector_config=Configure.Vectorizer.none(),
                 properties=[
                     Property(
                         name="codebase_name",
