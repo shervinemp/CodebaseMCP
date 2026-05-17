@@ -1,4 +1,5 @@
 """MCP Server for Python Code Analysis."""
+
 from __future__ import annotations
 
 # --- Direct execution trampoline ---
