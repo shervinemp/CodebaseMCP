@@ -1,4 +1,5 @@
 google-generativeai
+openai
 weaviate-client
 pytest
 pytest-asyncio
