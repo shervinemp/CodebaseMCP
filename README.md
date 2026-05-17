@@ -1,6 +1,6 @@
 # Python Codebase Analysis RAG System
 
-This system analyzes Python code using Abstract Syntax Trees (AST), stores the extracted information (functions, classes, calls, variables, etc.) in a Weaviate vector database, and provides tools for querying and understanding the codebase via a Model Context Protocol (MCP) server. It leverages Google's Gemini models for generating embeddings and natural language descriptions/answers.
+This system analyzes Python code using Abstract Syntax Trees (AST), stores the extracted information (functions, classes, calls, variables, etc.) in a Weaviate vector database, and provides tools for querying and understanding the codebase via a Model Context Protocol (MCP) server. It supports pluggable LLM providers (Gemini, OpenAI) for generating embeddings and natural language descriptions/answers.
 
 ## Features
 
@@ -35,11 +35,18 @@ This system analyzes Python code using Abstract Syntax Trees (AST), stores the e
     pip install -r requirements.txt
     ```
 
-4. **API Key & Configuration:** Create a `.env` file in the project root and add your Gemini API key. You can also configure other settings:
+4. **API Key & Configuration:** Create a `.env` file in the project root and add your LLM provider API key. You can also configure other settings:
 
     ```dotenv
-    # --- Required ---
-    GEMINI_API_KEY=YOUR_API_KEY_HERE
+    # --- LLM Provider Selection ---
+    # Choose "gemini" (default) or "openai"
+    # LLM_PROVIDER=gemini
+
+    # --- Required (for your chosen provider) ---
+    # For Gemini:
+    GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
+    # For OpenAI:
+    # OPENAI_API_KEY=YOUR_OPENAI_API_KEY_HERE
 
     # --- Optional ---
     # Set to true to enable background LLM description generation and refinement
@@ -53,9 +60,14 @@ This system analyzes Python code using Abstract Syntax Trees (AST), stores the e
     # WEAVIATE_PORT=8080
     # WEAVIATE_GRPC_PORT=50051
 
-    # Specify alternative Gemini models if desired
-    # GENERATION_MODEL_NAME="models/gemini-pro"
-    # EMBEDDING_MODEL_NAME="models/embedding-001"
+    # Specify alternative models if desired
+    # Gemini: GENERATION_MODEL_NAME="models/gemini-2.0-flash-001"
+    # OpenAI: GENERATION_MODEL_NAME="gpt-4o"
+    # GENERATION_MODEL_NAME=...
+
+    # Gemini: EMBEDDING_MODEL_NAME="models/embedding-001"
+    # OpenAI: EMBEDDING_MODEL_NAME="text-embedding-3-small"
+    # EMBEDDING_MODEL_NAME=...
 
     # Adjust Weaviate batch size
     # WEAVIATE_BATCH_SIZE=100
@@ -76,10 +88,11 @@ This system analyzes Python code using Abstract Syntax Trees (AST), stores the e
 
 ## Architecture Overview
 
-This system analyzes Python code, stores the extracted information in a Weaviate vector database, and provides tools for querying and understanding the codebase via a Model Context Protocol (MCP) server. It leverages Google's Gemini models for generating embeddings and natural language descriptions/answers.
+This system analyzes Python code, stores the extracted information in a Weaviate vector database, and provides tools for querying and understanding the codebase via a Model Context Protocol (MCP) server. It supports pluggable LLM providers (Gemini, OpenAI) for generating embeddings and natural language descriptions/answers.
 
 The main modules are:
 
+* `llm/`: Pluggable LLM provider package. Supports Gemini and OpenAI for text generation and embeddings. Add new providers by implementing the `LLMProvider` interface in `llm/base.py`.
 * `code_scanner.py`: Finds Python files, parses them using AST, extracts structural elements (functions, classes, imports, calls, etc.), and prepares data for Weaviate.
 * `weaviate_client.py`: Manages the connection to Weaviate, defines the data schema (`CodeFile`, `CodeElement`, `CodebaseRegistry`), and provides functions for batch uploading, querying, updating, and deleting data.
 * `rag.py`: Implements Retrieval-Augmented Generation (RAG) for answering questions about the codebase. It uses semantic search to find relevant code elements and an LLM to synthesize an answer.

@@ -1,10 +1,11 @@
-import sys
 import os
 
 # Ensure the project root is in the path
 # sys.path.insert(0, os.path.abspath(os.path.dirname(__file__))) # Adjusted below
 
-import pytest, asyncio, time
+import pytest
+import asyncio
+import time
 from unittest.mock import patch, MagicMock, AsyncMock
 from weaviate.classes.tenants import Tenant
 import weaviate.classes.query as wvc_query  # Import query classes
@@ -31,8 +32,6 @@ from src.code_analysis_mcp.weaviate_client import (
     add_project_registry_entry,
     get_all_projects,
     add_objects_batch,
-    find_element_by_name,  # Rename to avoid conflict with tool
-    get_element_details,  # Rename to avoid conflict with tool
     delete_project_registry_entry,  # Import for cleanup
 )
 

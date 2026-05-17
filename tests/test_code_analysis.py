@@ -2,8 +2,6 @@ import os
 import ast
 import pytest
 import shutil
-from weaviate.util import generate_uuid5
-from weaviate.classes.tenants import Tenant  # Added import
 
 # Update imports to reflect new structure
 import sys
@@ -18,12 +16,7 @@ from src.code_analysis_mcp.code_scanner import (
 )
 from src.code_analysis_mcp.weaviate_client import (
     create_weaviate_client,
-    find_element_by_name,
-    delete_elements_by_file_path,
-    delete_code_file,
-    create_schema,
-    add_objects_batch,  # Needed for test setup
-    add_references_batch,  # Needed for test setup
+    create_schema,  # Needed for test setup
 )
 
 
