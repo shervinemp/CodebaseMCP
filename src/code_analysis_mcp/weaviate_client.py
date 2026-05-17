@@ -29,9 +29,7 @@ def create_weaviate_client():
     port = int(os.getenv("WEAVIATE_PORT", "8080"))
     grpc_port = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
 
-    logger.info(
-        f"Connecting to Weaviate at {host}:{port} (gRPC: {grpc_port})"
-    )
+    logger.info(f"Connecting to Weaviate at {host}:{port} (gRPC: {grpc_port})")
     client = weaviate.connect_to_local(host=host, port=port, grpc_port=grpc_port)
     logger.info("Weaviate client object created.")
     return client
@@ -745,6 +743,7 @@ def find_relevant_elements(
         query_vector = None
         try:
             from .llm import get_llm_provider
+
             provider = get_llm_provider()
             if provider and provider.is_available:
                 query_vector = provider.embed(query_text, task_type="RETRIEVAL_QUERY")
@@ -759,12 +758,22 @@ def find_relevant_elements(
                 kwargs = dict(
                     limit=limit,
                     return_properties=[
-                        "name", "element_type", "file_path",
-                        "start_line", "end_line", "code_snippet",
-                        "docstring", "parameters", "return_type",
-                        "signature", "readable_id", "decorators",
-                        "attribute_accesses", "parent_scope_uuid",
-                        "llm_description", "user_clarification",
+                        "name",
+                        "element_type",
+                        "file_path",
+                        "start_line",
+                        "end_line",
+                        "code_snippet",
+                        "docstring",
+                        "parameters",
+                        "return_type",
+                        "signature",
+                        "readable_id",
+                        "decorators",
+                        "attribute_accesses",
+                        "parent_scope_uuid",
+                        "llm_description",
+                        "user_clarification",
                         "base_class_names",
                     ],
                 )
@@ -790,9 +799,7 @@ def find_relevant_elements(
                                     if obj.metadata and obj.metadata.distance
                                     else None
                                 ),
-                                "score": (
-                                    obj.metadata.score if obj.metadata else None
-                                ),
+                                "score": (obj.metadata.score if obj.metadata else None),
                                 "_tenant_id": tenant_id,
                             }
                         )

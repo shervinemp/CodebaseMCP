@@ -13,9 +13,46 @@ try:
         generate_codebase_summary,
     )
 except ImportError as e:
-    pytest.skip(
-        f"Could not import RAG/Scanner module: {e}", allow_module_level=True
+    pytest.skip(f"Could not import RAG/Scanner module: {e}", allow_module_level=True)
+
+
+# --- Tests for include_dependencies on ask_question ---
+
+
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
+@patch("src.code_analysis_mcp.rag.create_weaviate_client")
+@patch("src.code_analysis_mcp.rag.find_relevant_elements")
+@pytest.mark.asyncio
+async def test_rag_excludes_dependencies(
+    mock_find_elements, mock_create_client, mock_get_provider
+):
+    """When include_dependencies=False, only the primary tenant is queried."""
+    mock_get_provider.return_value = create_mock_provider("answer")
+    mock_client = MagicMock()
+    mock_client.is_connected.return_value = True
+    mock_collections = MagicMock()
+    mock_tenants = MagicMock()
+    mock_tenants.exists.return_value = True
+    mock_collections.get.return_value.tenants = mock_tenants
+    mock_client.collections = mock_collections
+    mock_create_client.return_value = mock_client
+    mock_find_elements.return_value = [
+        {"uuid": "x", "properties": {"code_snippet": "def foo(): pass"}}
+    ]
+
+    answer = await answer_codebase_question(
+        "test?", client=mock_client, tenant_id="Primary", include_dependencies=False
     )
+
+    assert "answer" in answer
+    # Should not have fetched deps — get_codebase_details should not be called
+    # find_relevant_elements should be called with only [Primary]
+    call_args = mock_find_elements.call_args
+    assert call_args is not None
+    assert call_args[0][1] == ["Primary"]  # tenant_ids
+
+
+# --- Tests for include_dependencies on ask_question ---
 
 
 def create_mock_weaviate_object(uuid, properties, vector=None, references=None):

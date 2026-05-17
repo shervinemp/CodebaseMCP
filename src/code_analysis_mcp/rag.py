@@ -20,7 +20,10 @@ load_dotenv()
 
 # --- RAG Function ---
 async def answer_codebase_question(
-    query_text: str, client=None, tenant_id: str = None
+    query_text: str,
+    client=None,
+    tenant_id: str = None,
+    include_dependencies: bool = True,
 ) -> str:
     """
     Answers questions about the codebase using RAG:
@@ -84,27 +87,35 @@ async def answer_codebase_question(
 
         # --- Dependency Handling ---
         tenant_ids_to_query = [tenant_id]
-        try:
-            # Fetch dependencies for the primary tenant (wrap sync call)
-            codebase_details = await asyncio.to_thread(
-                get_codebase_details, weaviate_client, tenant_id
-            )
-            if codebase_details and codebase_details.get("dependencies"):
-                dependencies = codebase_details["dependencies"]
-                logger.info(f"Found dependencies for RAG: {dependencies}")
-                # Check if dependency tenants exist before adding (wrap sync call)
-                for dep_name in dependencies:
-                    dep_exists = await asyncio.to_thread(
-                        elements_collection.tenants.exists, dep_name
+        if include_dependencies:
+            try:
+                codebase_details = await asyncio.to_thread(
+                    get_codebase_details, weaviate_client, tenant_id
+                )
+                deps = (
+                    codebase_details.get("dependencies") if codebase_details else None
+                )
+                if deps:
+                    results = await asyncio.gather(
+                        *[
+                            asyncio.to_thread(elements_collection.tenants.exists, dep)
+                            for dep in deps
+                        ],
+                        return_exceptions=True,
                     )
-                    if dep_exists:
-                        tenant_ids_to_query.append(dep_name)
-                    else:
-                        logger.warning(
-                            f"Dependency codebase (tenant) '{dep_name}' not found in Weaviate. Skipping for RAG."
-                        )
-        except Exception as dep_e:
-            logger.error(f"Error fetching dependencies for RAG query: {dep_e}")
+                    for dep_name, exists in zip(deps, results):
+                        if isinstance(exists, Exception):
+                            logger.warning(
+                                f"Error checking dependency '{dep_name}': {exists}"
+                            )
+                        elif exists:
+                            tenant_ids_to_query.append(dep_name)
+                        else:
+                            logger.warning(
+                                f"Dependency codebase '{dep_name}' not found. Skipping."
+                            )
+            except Exception as dep_e:
+                logger.error(f"Error fetching dependencies for RAG query: {dep_e}")
         # --- End Dependency Handling ---
 
         # 1. Find relevant context using hybrid search across tenants

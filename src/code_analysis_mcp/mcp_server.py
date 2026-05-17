@@ -1016,15 +1016,35 @@ async def scan_codebase(
             logger.info(
                 f"Scheduling {llm_tasks_started} elements for DAG-ordered LLM processing in tenant '{tenant_id}'."
             )
+            # Use a queue-based producer/consumer to avoid N asyncio tasks
+            queue: asyncio.Queue[str] = asyncio.Queue()
             for uuid in sorted_uuids:
-                llm_task = asyncio.create_task(
-                    process_element_llm(client, uuid, tenant_id)
-                )
-                background_llm_tasks.add(llm_task)
-                llm_task.add_done_callback(background_llm_tasks.discard)
+                await queue.put(uuid)
+
+            async def _worker():
+                while True:
+                    try:
+                        uuid = await asyncio.wait_for(queue.get(), timeout=1)
+                    except TimeoutError:
+                        break
+                    try:
+                        await process_element_llm(client, uuid, tenant_id)
+                    except Exception as w_e:
+                        logger.error(f"Enrichment worker failed for {uuid}: {w_e}")
+                    finally:
+                        queue.task_done()
+
+            workers = [
+                asyncio.create_task(_worker())
+                for _ in range(min(LLM_CONCURRENCY, llm_tasks_started))
+            ]
+            background_llm_tasks.update(workers)
+            for w in workers:
+                w.add_done_callback(background_llm_tasks.discard)
+
             final_message += (
                 f" Background LLM enrichment started for {llm_tasks_started} elements "
-                f"(DAG-ordered: callees before callers)."
+                f"({len(workers)} workers, DAG-ordered: callees before callers)."
             )
         elif not LLM_ENABLED:
             final_message += " LLM enrichment disabled."
@@ -1556,6 +1576,12 @@ async def ask_question(
             description="Natural language question about the codebase of the currently active codebase."
         ),
     ],
+    include_dependencies: Annotated[
+        bool,
+        Field(
+            description="Whether to also search across dependency codebases.",
+        ),
+    ] = True,
 ):
     """Answers a question using RAG against the ACTIVE_CODEBASE_NAME."""
     logger.info("--- ask_question tool execution START ---")
@@ -1571,7 +1597,10 @@ async def ask_question(
     logger.info(f"Asking question about active codebase '{tenant_id}': '{query}'")
     try:
         answer = await answer_codebase_question(
-            query, client=client, tenant_id=tenant_id
+            query,
+            client=client,
+            tenant_id=tenant_id,
+            include_dependencies=include_dependencies,
         )
         if answer.startswith("ERROR:"):
             return {"status": "error", "message": answer}
@@ -1748,14 +1777,34 @@ async def trigger_llm_processing(
         logger.info(
             f"Scheduling LLM processing for {len(uuids_to_process)} elements in codebase '{tenant_id}'."
         )
-        count = 0
-        for uuid_item in uuids_to_process:
-            task = asyncio.create_task(
-                process_element_llm(client, uuid_item, tenant_id)
-            )
-            background_llm_tasks.add(task)
-            task.add_done_callback(background_llm_tasks.discard)
-            count += 1
+        sorted_uuids = await _topological_sort_uuids(
+            client, tenant_id, uuids_to_process
+        )
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        for uuid_item in sorted_uuids:
+            await queue.put(uuid_item)
+
+        async def _worker():
+            while True:
+                try:
+                    uuid_item = await asyncio.wait_for(queue.get(), timeout=1)
+                except TimeoutError:
+                    break
+                try:
+                    await process_element_llm(client, uuid_item, tenant_id)
+                except Exception as w_e:
+                    logger.error(f"Enrichment worker failed for {uuid_item}: {w_e}")
+                finally:
+                    queue.task_done()
+
+        workers = [
+            asyncio.create_task(_worker())
+            for _ in range(min(LLM_CONCURRENCY, len(sorted_uuids)))
+        ]
+        background_llm_tasks.update(workers)
+        for w in workers:
+            w.add_done_callback(background_llm_tasks.discard)
+        count = len(sorted_uuids)
 
         return {
             "status": "success",

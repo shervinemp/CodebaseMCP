@@ -280,7 +280,9 @@ def mock_llm_and_helpers():
 @pytest.mark.asyncio
 @patch("os.path.isdir", return_value=True)  # Keep mocking os functions
 async def test_scan_project_success_new(
-    mock_isdir, setup_test_tenant, mock_llm_and_helpers  # Use new fixtures
+    mock_isdir,
+    setup_test_tenant,
+    mock_llm_and_helpers,  # Use new fixtures
 ):
     """Tests successful scanning of a new project using real Weaviate."""
     client, tenant_id = setup_test_tenant  # Get client and tenant ID
@@ -345,7 +347,9 @@ async def test_scan_project_success_new(
 @pytest.mark.asyncio
 @patch("os.path.isdir", return_value=True)
 async def test_scan_project_already_exists_registry(
-    mock_isdir, setup_test_tenant, mock_llm_and_helpers  # Use new fixtures
+    mock_isdir,
+    setup_test_tenant,
+    mock_llm_and_helpers,  # Use new fixtures
 ):
     """Tests scanning when project already exists in the registry."""
     client, tenant_id = setup_test_tenant  # Use base test tenant for setup
@@ -377,7 +381,9 @@ async def test_scan_project_already_exists_registry(
 @pytest.mark.asyncio
 @patch("os.path.isdir", return_value=True)
 async def test_scan_project_tenant_exists_inconsistent(
-    mock_isdir, setup_test_tenant, mock_llm_and_helpers  # Use new fixtures
+    mock_isdir,
+    setup_test_tenant,
+    mock_llm_and_helpers,  # Use new fixtures
 ):
     """Tests scanning when tenant exists but project is not in registry."""
     client, _ = setup_test_tenant  # Don't need base tenant_id directly
@@ -412,7 +418,9 @@ async def test_scan_project_tenant_exists_inconsistent(
 @pytest.mark.asyncio
 @patch("os.path.isdir", return_value=True)
 async def test_scan_project_scan_fails(
-    mock_isdir, setup_test_tenant, mock_llm_and_helpers  # Use new fixtures
+    mock_isdir,
+    setup_test_tenant,
+    mock_llm_and_helpers,  # Use new fixtures
 ):
     """Tests scanning when the underlying _scan_cleanup_and_upload fails."""
     client, tenant_id = setup_test_tenant
@@ -677,9 +685,9 @@ async def test_find_element_success(
     ]  # <-- Align closing bracket with list start
     # Add assertion to check batch success
     batch_result = add_objects_batch(client, elements_to_add, "CodeElement", tenant_id)
-    assert (
-        batch_result.get("status") == "success"
-    ), f"Batch add failed: {batch_result.get('message')}"  # Corrected indentation
+    assert batch_result.get("status") == "success", (
+        f"Batch add failed: {batch_result.get('message')}"
+    )  # Corrected indentation
     # Wait longer for indexing
     await asyncio.sleep(5.0)  # Increased sleep significantly
 
@@ -694,9 +702,9 @@ async def test_find_element_success(
             "description": props.get("llm_description") or props.get("docstring"),
         }
 
-    mock_llm_and_helpers["_process_element_properties"].side_effect = (
-        process_side_effect
-    )
+    mock_llm_and_helpers[
+        "_process_element_properties"
+    ].side_effect = process_side_effect
 
     # --- Execute ---
     args = FindElementArgs(name="my_func_find", limit=5)
@@ -794,9 +802,9 @@ async def test_get_details_success(setup_test_tenant, mock_llm_and_helpers):
         }
         return processed
 
-    mock_llm_and_helpers["_process_element_properties"].side_effect = (
-        process_detail_side_effect
-    )
+    mock_llm_and_helpers[
+        "_process_element_properties"
+    ].side_effect = process_detail_side_effect
 
     # --- Execute ---
     args = GetDetailsArgs(uuid=element_uuid)
@@ -841,9 +849,9 @@ async def test_ask_question_success(
     from src.code_analysis_mcp.mcp_server import ask_question  # Import tool
 
     mcp_server.ACTIVE_PROJECT_NAME = tenant_id
-    mock_llm_and_helpers["answer_codebase_question"].return_value = (
-        "This project does X and Y."
-    )
+    mock_llm_and_helpers[
+        "answer_codebase_question"
+    ].return_value = "This project does X and Y."
 
     # --- Execute ---
     args = AskQuestionArgs(query="What does it do?")
@@ -928,9 +936,9 @@ async def test_analyze_snippet_success(
             "description": None,
         }
 
-    mock_llm_and_helpers["_process_element_properties"].side_effect = (
-        process_side_effect_snippet
-    )
+    mock_llm_and_helpers[
+        "_process_element_properties"
+    ].side_effect = process_side_effect_snippet
 
     # --- Execute ---
     args = AnalyzeSnippetArgs(code_snippet="x = my_var_snip; other_func_snip()")
