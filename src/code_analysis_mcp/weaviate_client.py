@@ -729,16 +729,11 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
     )
     all_results = []
     try:
-        logger.debug("find_relevant_elements: Importing google.generativeai...")
-        import google.generativeai as genai
-        from code_scanner import embedding_model_name
+        from llm import get_llm_provider
 
-        logger.debug(
-            f"find_relevant_elements: Using embedding model: {embedding_model_name}"
-        )
-
-        if not embedding_model_name:
-            logger.error("find_relevant_elements: Embedding model name not configured.")
+        provider = get_llm_provider()
+        if not provider or not provider.is_available:
+            logger.error("find_relevant_elements: LLM provider not available.")
             return []
 
         logger.debug(
@@ -746,12 +741,10 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
         )
         query_vector = None
         try:
-            query_vector_result = genai.embed_content(
-                model=embedding_model_name,
-                content=query_text,
+            query_vector = provider.embed(
+                query_text,
                 task_type="RETRIEVAL_QUERY",
             )
-            query_vector = query_vector_result.get("embedding")
         except Exception as embed_e:
             logger.exception(
                 f"find_relevant_elements: Exception during embedding generation: {embed_e}"
@@ -760,7 +753,7 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
 
         if not query_vector:
             logger.error(
-                f"find_relevant_elements: Failed to generate query vector for '{query_text}'. Result: {query_vector_result}"
+                f"find_relevant_elements: Failed to generate query vector for '{query_text}'."
             )
             return []
         logger.debug(

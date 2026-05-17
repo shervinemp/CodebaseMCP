@@ -10,7 +10,7 @@ from watchdog.events import (
     FileCreatedEvent,
     FileDeletedEvent,
 )
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple
 
 # Assuming these imports are needed based on the moved code
 from .weaviate_client import WeaviateManager
@@ -243,7 +243,7 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
                     )
             except AttributeError:
                 logger.error(
-                    f"Watcher: WeaviateManager does not have the 'queue_llm_processing' method. LLM re-processing trigger skipped."
+                    "Watcher: WeaviateManager does not have the 'queue_llm_processing' method. LLM re-processing trigger skipped."
                 )
             except Exception as llm_e:
                 logger.error(

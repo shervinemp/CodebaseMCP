@@ -72,11 +72,16 @@ LLM_ENABLED = os.getenv("GENERATE_LLM_DESCRIPTIONS", "false").lower() == "true"
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "5"))
 WATCHER_POLLING_INTERVAL = int(os.getenv("WATCHER_POLLING_INTERVAL", "5"))
 
-if LLM_ENABLED and not os.getenv("GEMINI_API_KEY"):
-    logger.warning(
-        "GENERATE_LLM_DESCRIPTIONS is true in .env, but GEMINI_API_KEY is missing. LLM features will be disabled."
-    )
-    LLM_ENABLED = False
+if LLM_ENABLED:
+    from llm import init_llm_provider, get_llm_provider
+
+    init_llm_provider()
+    provider = get_llm_provider()
+    if not provider or not provider.is_available:
+        logger.warning(
+            "LLM provider not available. Check LLM_PROVIDER and API key settings. LLM features will be disabled."
+        )
+        LLM_ENABLED = False
 
 
 # --- Global State ---
@@ -444,19 +449,19 @@ async def lifespan(app: FastMCP):
             logger.info("Lifespan: Starting readiness check loop...")
             is_ready = False
             for attempt in range(5):
-                logger.info(f"Lifespan: Readiness check attempt {attempt+1}/5...")
+                logger.info(f"Lifespan: Readiness check attempt {attempt + 1}/5...")
                 try:
                     if global_weaviate_client.is_ready():
                         is_ready = True
                         logger.info("Lifespan: Weaviate client is ready.")
                         break
                     logger.warning(
-                        f"Lifespan: Weaviate client not ready yet (attempt {attempt+1}/5). Waiting..."
+                        f"Lifespan: Weaviate client not ready yet (attempt {attempt + 1}/5). Waiting..."
                     )
                     await asyncio.sleep(1)
                 except Exception as ready_e:
                     logger.error(
-                        f"Lifespan: Error during readiness check (attempt {attempt+1}/5): {ready_e}"
+                        f"Lifespan: Error during readiness check (attempt {attempt + 1}/5): {ready_e}"
                     )
                     await asyncio.sleep(1)
 
@@ -547,7 +552,7 @@ logger.info("--- Attempting FastMCP instantiation ---")
 
 mcp = FastMCP(
     name="code-analysis-mcp",
-    description="MCP Server for Python Code Analysis using AST, Weaviate, and Gemini, with codebase management.",
+    description="MCP Server for Python Code Analysis using AST, Weaviate, and LLM (Gemini/OpenAI), with codebase management.",
     lifespan=lifespan,
 )
 logger.info("--- FastMCP instantiation successful ---")

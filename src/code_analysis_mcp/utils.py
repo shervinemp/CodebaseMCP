@@ -2,7 +2,7 @@ import os
 import logging
 import re
 import ast
-from typing import Any, Dict, Optional, List  # Added List
+from typing import Any  # Added List
 
 # Assuming WeaviateManager might be needed if _process_element_properties evolves
 # from .weaviate_client import WeaviateManager

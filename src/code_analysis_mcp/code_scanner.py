@@ -1,21 +1,16 @@
 import os
 import ast
-import google.generativeai as genai
-import google.api_core.exceptions
 import datetime
 import asyncio
 import re
 from dotenv import load_dotenv
 from weaviate_client import (  # Use relative import
-    create_weaviate_client,
     get_all_code_files,
     delete_elements_by_file_path,
     delete_code_file,
     add_objects_batch,
     add_references_batch,
-    find_element_by_name,
     get_element_details,
-    update_element_properties,
 )
 from weaviate.util import generate_uuid5
 import logging
@@ -29,31 +24,9 @@ logger.info("Environment variables loaded for code_scanner.")
 
 # --- Configuration ---
 VERBOSE_LOGGING = os.getenv("CODE_SCANNER_VERBOSE", "False").lower() == "true"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GENERATE_LLM_DESCRIPTIONS = (
     os.getenv("GENERATE_LLM_DESCRIPTIONS", "false").lower() == "true"
 )
-model = None
-embedding_model_name = None
-
-
-if not GEMINI_API_KEY:
-    if VERBOSE_LOGGING:
-        logger.warning("GEMINI_API_KEY not found. LLM features disabled.")
-else:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        GENERATION_MODEL_NAME = os.getenv(
-            "GENERATION_MODEL_NAME", "models/gemini-2.0-flash-001"
-        )
-        model = genai.GenerativeModel(GENERATION_MODEL_NAME)
-        embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "models/embedding-001")
-        if VERBOSE_LOGGING:
-            logger.info(f"Using Generation Model: {GENERATION_MODEL_NAME}")
-            logger.info(f"Using Embedding Model: {embedding_model_name}")
-    except Exception as e:
-        logger.error(f"Error initializing Gemini models: {type(e).__name__}: {e}")
-        raise
 
 
 # --- Helper Functions ---
@@ -508,9 +481,18 @@ async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
     and updates it in Weaviate. Runs LLM calls in a thread.
     Returns True on success/no action needed, False on failure.
     """
-    if not GENERATE_LLM_DESCRIPTIONS or not model or not embedding_model_name:
+    from llm import get_llm_provider, LLMProviderError
+
+    if not GENERATE_LLM_DESCRIPTIONS:
         logger.debug(
             f"LLM generation disabled, skipping enrichment for {element_uuid} in tenant {tenant_id}"
+        )
+        return True
+
+    provider = get_llm_provider()
+    if not provider or not provider.is_available:
+        logger.debug(
+            f"LLM provider unavailable, skipping enrichment for {element_uuid} in tenant {tenant_id}"
         )
         return True
 
@@ -570,16 +552,14 @@ async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
             logger.debug(
                 f"Generating embedding for {element_uuid} ({name}) in tenant {tenant_id}"
             )
-            embedding_result = await asyncio.to_thread(
-                genai.embed_content,
-                model=embedding_model_name,
-                content=content_to_embed,
-                task_type="RETRIEVAL_DOCUMENT",
+            new_vector = await asyncio.to_thread(
+                provider.embed,
+                content_to_embed,
+                "RETRIEVAL_DOCUMENT",
             )
-            new_vector = embedding_result.get("embedding")
-        except google.api_core.exceptions.GoogleAPIError as embed_e:
+        except LLMProviderError as embed_e:
             logger.warning(
-                f"Embedding generation failed for {element_uuid} in tenant {tenant_id}: {type(embed_e).__name__}: {embed_e}"
+                f"Embedding generation failed for {element_uuid} in tenant {tenant_id}: {embed_e}"
             )
             raise
 
@@ -587,21 +567,16 @@ async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
             logger.debug(
                 f"Generating initial description for {element_uuid} ({name}) in tenant {tenant_id}"
             )
-            # Wrap synchronous LLM call
-            description_response = await asyncio.to_thread(
-                model.generate_content, prompt
-            )
-            generated_desc = description_response.text.strip()
+            generated_desc = await asyncio.to_thread(provider.generate, prompt)
             new_description = generated_desc
             logger.debug(
                 f"Generated description for {element_uuid} in tenant {tenant_id}: {new_description}"
             )
-        except google.api_core.exceptions.GoogleAPIError as desc_e:
+        except LLMProviderError as desc_e:
             logger.warning(
-                f"Initial description generation failed for {element_uuid} in tenant {tenant_id}: {type(desc_e).__name__}: {desc_e}"
+                f"Initial description generation failed for {element_uuid} in tenant {tenant_id}: {desc_e}"
             )
-            # Don't raise, just proceed without description if it fails
-            new_description = current_desc  # Keep old description if generation fails
+            new_description = current_desc
 
         if new_vector or (new_description and new_description != current_desc):
             props_to_update = props.copy()
@@ -610,12 +585,9 @@ async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
                 f"Updating element {element_uuid} in tenant {tenant_id} with new description/vector."
             )
             try:
-                # Wrap synchronous Weaviate call
                 collection = client.collections.get("CodeElement")
                 await asyncio.to_thread(
-                    collection.with_tenant(
-                        tenant_id
-                    ).data.replace,  # Corrected: replace was already wrapped, no change needed here. Retaining original wrap.
+                    collection.with_tenant(tenant_id).data.replace,
                     uuid=element_uuid,
                     properties=props_to_update,
                     vector=(new_vector if new_vector else element.vector),

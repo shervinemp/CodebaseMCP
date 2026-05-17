@@ -1,7 +1,4 @@
-import os
 import logging
-import google.generativeai as genai
-import google.api_core.exceptions
 from dotenv import load_dotenv
 import asyncio
 import re
@@ -13,31 +10,12 @@ from weaviate_client import (
     get_element_details,
     update_element_properties,
     find_element_by_name,
-    get_codebase_details,  # Import needed function
+    get_codebase_details,
 )
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
-# --- Configuration ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-model = None
-embedding_model_name = None
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        GENERATION_MODEL_NAME = os.getenv(
-            "GENERATION_MODEL_NAME", "models/gemini-2.0-flash-001"
-        )
-        model = genai.GenerativeModel(GENERATION_MODEL_NAME)
-        embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "models/embedding-001")
-    except Exception as e:
-        logger.error(f"Error initializing Gemini models in rag.py: {e}")
-        model = None
-        embedding_model_name = None
-else:
-    logger.warning("GEMINI_API_KEY not found in rag.py. LLM features disabled.")
 
 
 # --- RAG Function ---
@@ -53,8 +31,11 @@ async def answer_codebase_question(
     logger.info(f"Answering question: '{query_text}' for tenant '{tenant_id}'")
 
     # Ensure LLM models are available
-    if not model or not embedding_model_name:
-        return "ERROR: Generative or embedding model not configured in rag.py. Cannot answer question."
+    from llm import get_llm_provider
+
+    provider = get_llm_provider()
+    if not provider or not provider.is_available:
+        return "ERROR: LLM provider not available. Cannot answer question."
 
     # Ensure tenant_id is provided
     if not tenant_id:
@@ -243,16 +224,16 @@ async def answer_codebase_question(
         # 5. Call generative LLM
         logger.debug("answer_codebase_question: Generating answer with LLM...")
         try:
-            # Wrap synchronous LLM call
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            answer = response.text.strip()
+            from llm import LLMProviderError
+
+            answer = await asyncio.to_thread(provider.generate, prompt)
             logger.info("answer_codebase_question: LLM generation successful.")
             return answer
-        except google.api_core.exceptions.GoogleAPIError as api_e:
+        except LLMProviderError as api_e:
             logger.exception(
-                f"answer_codebase_question: Google API exception during LLM generation: {api_e}"
+                f"answer_codebase_question: LLM provider error during generation: {api_e}"
             )
-            return f"ERROR: Google API error during generation: {api_e}"
+            return f"ERROR: LLM provider error during generation: {api_e}"
         except Exception as llm_e:
             logger.exception(
                 f"answer_codebase_question: Exception during LLM generation: {llm_e}"
@@ -284,9 +265,12 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
         f"Refining description for element UUID: {element_uuid} in tenant '{tenant_id}'"
     )
 
-    if not model:
+    from llm import get_llm_provider, LLMProviderError, RateLimitError
+
+    provider = get_llm_provider()
+    if not provider or not provider.is_available:
         logger.error(
-            "refine_element_description: LLM model not configured. Cannot refine."
+            "refine_element_description: LLM provider not available. Cannot refine."
         )
         return False
 
@@ -495,15 +479,12 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
                 logger.debug(
                     f"Attempt {attempt + 1} to generate refined description for {target_name}"
                 )
-                refinement_response = await asyncio.to_thread(
-                    model.generate_content, prompt
-                )
-                refined_desc = refinement_response.text.strip()
+                refined_desc = await asyncio.to_thread(provider.generate, prompt)
                 logger.info(
                     f"LLM refinement successful for {target_name} on attempt {attempt + 1}."
                 )
                 break
-            except google.api_core.exceptions.ResourceExhausted as rate_limit_e:
+            except RateLimitError as rate_limit_e:
                 logger.warning(
                     f"Rate limit hit during refinement for {target_name} (Attempt {attempt + 1}/{max_retries}): {rate_limit_e}. Retrying in {retry_delay}s..."
                 )
@@ -516,9 +497,9 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
                     )
                     refined_desc = None
                     break
-            except google.api_core.exceptions.GoogleAPIError as api_e:
+            except LLMProviderError as api_e:
                 logger.warning(
-                    f"Google API error during description refinement for {target_name}: {api_e}"
+                    f"LLM provider error during description refinement for {target_name}: {api_e}"
                 )
                 refined_desc = None
                 break
@@ -571,11 +552,14 @@ async def generate_codebase_summary(client, codebase_name: str) -> str:
     """
     logger.info(f"Generating summary for codebase (tenant): '{codebase_name}'")
 
-    if not model:
+    from llm import get_llm_provider, LLMProviderError
+
+    provider = get_llm_provider()
+    if not provider or not provider.is_available:
         logger.error(
-            "generate_codebase_summary: LLM model not configured. Cannot summarize."
+            "generate_codebase_summary: LLM provider not available. Cannot summarize."
         )
-        return "Error: LLM model not configured."
+        return "Error: LLM provider not available."
 
     weaviate_client = client
     if not weaviate_client or not weaviate_client.is_connected():
@@ -653,15 +637,14 @@ async def generate_codebase_summary(client, codebase_name: str) -> str:
             f"--- Codebase Summary Prompt for {codebase_name} ---\n{prompt}\n------------------"
         )
 
-        # Call LLM for Summary (wrap sync call)
+        # Call LLM for Summary
         try:
-            summary_response = await asyncio.to_thread(model.generate_content, prompt)
-            summary = summary_response.text.strip()
+            summary = await asyncio.to_thread(provider.generate, prompt)
             logger.info(f"Successfully generated summary for codebase {codebase_name}.")
             return summary
-        except google.api_core.exceptions.GoogleAPIError as api_e:
+        except LLMProviderError as api_e:
             logger.exception(
-                f"Google API exception during summary generation for {codebase_name}: {api_e}"
+                f"LLM provider error during summary generation for {codebase_name}: {api_e}"
             )
             return f"Error generating summary (API Error): {api_e}"
         except Exception as llm_e:
