@@ -16,13 +16,13 @@ class GeminiProvider(LLMProvider):
         if self.api_key:
             try:
                 genai.configure(api_key=self.api_key)
-model_name = os.getenv(
-    "GENERATION_MODEL_NAME", "models/gemini-3.1-flash-lite-preview"
-)
+                model_name = os.getenv(
+                    "GENERATION_MODEL_NAME", "models/gemini-3.1-flash-lite-preview"
+                )
                 self._model = genai.GenerativeModel(model_name)
-self._embedding_model_name = os.getenv(
-    "EMBEDDING_MODEL_NAME", "models/gemini-embedding-2"
-)
+                self._embedding_model_name = os.getenv(
+                    "EMBEDDING_MODEL_NAME", "models/gemini-embedding-2"
+                )
                 logger.info(
                     f"GeminiProvider: generation={model_name}, embedding={self._embedding_model_name}"
                 )

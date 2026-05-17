@@ -735,108 +735,77 @@ def find_relevant_elements(
         limit = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "5"))
     if distance is None:
         distance = float(os.getenv("SEMANTIC_SEARCH_DISTANCE", "0.7"))
-    """Finds relevant elements using vector search based on query text across multiple tenants."""
+    """Finds relevant elements using hybrid (vector + keyword) search across tenants."""
     logger.info(
         f"Starting find_relevant_elements across tenants {tenant_ids} for query: '{query_text}', class='{element_class}', limit={limit}, distance={distance}"
     )
     all_results = []
     try:
-        from .llm import get_llm_provider
-
-        provider = get_llm_provider()
-        if not provider or not provider.is_available:
-            logger.error("find_relevant_elements: LLM provider not available.")
-            return []
-
-        logger.debug(
-            f"find_relevant_elements: Generating query vector for: '{query_text}'"
-        )
+        provider = None
         query_vector = None
         try:
-            query_vector = provider.embed(
-                query_text,
-                task_type="RETRIEVAL_QUERY",
-            )
-        except Exception as embed_e:
-            logger.exception(
-                f"find_relevant_elements: Exception during embedding generation: {embed_e}"
-            )
-            return []
+            from .llm import get_llm_provider
+            provider = get_llm_provider()
+            if provider and provider.is_available:
+                query_vector = provider.embed(query_text, task_type="RETRIEVAL_QUERY")
+        except Exception:
+            logger.warning("Embedding failed, falling back to keyword-only search.")
 
-        if not query_vector:
-            logger.error(
-                f"find_relevant_elements: Failed to generate query vector for '{query_text}'."
-            )
-            return []
-        logger.debug(
-            f"find_relevant_elements: Generated query vector (length: {len(query_vector)}). Performing Weaviate search..."
-        )
-
-        collection = None
-        response = None
         collection = client.collections.get(element_class)
 
         for tenant_id in tenant_ids:
             logger.debug(f"Querying tenant: {tenant_id}")
             try:
-                response = collection.with_tenant(tenant_id).query.near_vector(
-                    near_vector=query_vector,
+                kwargs = dict(
                     limit=limit,
-                    distance=distance,
-                    return_metadata=wvc_query.MetadataQuery(distance=True),
                     return_properties=[
-                        "name",
-                        "element_type",
-                        "file_path",
-                        "start_line",
-                        "end_line",
-                        "code_snippet",
-                        "docstring",
-                        "parameters",
-                        "return_type",
-                        "signature",
-                        "readable_id",
-                        "decorators",
-                        "attribute_accesses",
-                        "parent_scope_uuid",
-                        "llm_description",
-                        "user_clarification",
+                        "name", "element_type", "file_path",
+                        "start_line", "end_line", "code_snippet",
+                        "docstring", "parameters", "return_type",
+                        "signature", "readable_id", "decorators",
+                        "attribute_accesses", "parent_scope_uuid",
+                        "llm_description", "user_clarification",
                         "base_class_names",
                     ],
                 )
-                logger.debug(
-                    f"find_relevant_elements: Weaviate near_vector query successful for tenant '{tenant_id}'."
-                )
+                if query_vector:
+                    kwargs["query"] = query_text
+                    kwargs["vector"] = query_vector
+                    kwargs["alpha"] = 0.5
+                    kwargs["return_metadata"] = wvc_query.MetadataQuery(distance=True)
+                else:
+                    kwargs["query"] = query_text
+                    kwargs["alpha"] = 0
+
+                response = collection.with_tenant(tenant_id).query.hybrid(**kwargs)
+
                 if response and response.objects:
-                    logger.debug(
-                        f"find_relevant_elements: Processing {len(response.objects)} results from Weaviate for tenant '{tenant_id}'."
-                    )
                     for obj in response.objects:
                         all_results.append(
                             {
                                 "uuid": str(obj.uuid),
                                 "properties": obj.properties,
                                 "distance": (
-                                    obj.metadata.distance if obj.metadata else None
+                                    obj.metadata.distance
+                                    if obj.metadata and obj.metadata.distance
+                                    else None
+                                ),
+                                "score": (
+                                    obj.metadata.score if obj.metadata else None
                                 ),
                                 "_tenant_id": tenant_id,
                             }
                         )
-                else:
-                    logger.debug(
-                        f"find_relevant_elements: No objects found in Weaviate response for tenant '{tenant_id}'."
-                    )
             except Exception as weaviate_e:
                 logger.error(
-                    f"find_relevant_elements: Exception during Weaviate near_vector query for tenant '{tenant_id}': {weaviate_e}"
+                    f"find_relevant_elements: Exception during Weaviate hybrid query for tenant '{tenant_id}': {weaviate_e}"
                 )
 
-        # Sort aggregated results by distance (ascending) and apply overall limit
-        all_results.sort(key=lambda x: x.get("distance") or float("inf"))
+        all_results.sort(key=lambda x: x.get("distance") or x.get("score") or 0)
         final_results = all_results[:limit]
 
         logger.info(
-            f"find_relevant_elements completed across tenants {tenant_ids}. Found {len(final_results)} final results (after limit)."
+            f"find_relevant_elements completed across tenants {tenant_ids}. Found {len(final_results)} final results."
         )
         return final_results
 
