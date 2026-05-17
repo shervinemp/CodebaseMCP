@@ -1,3 +1,4 @@
+import os
 import weaviate
 import datetime
 import weaviate.classes.query as wvc_query
@@ -24,8 +25,15 @@ def create_weaviate_client():
     load_dotenv()
     logger.debug(".env loaded.")
 
-    client = weaviate.connect_to_local()
-    logger.info("Weaviate client object created using connect_to_local().")
+    host = os.getenv("WEAVIATE_HOST", "localhost")
+    port = int(os.getenv("WEAVIATE_PORT", "8080"))
+    grpc_port = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
+
+    logger.info(
+        f"Connecting to Weaviate at {host}:{port} (gRPC: {grpc_port})"
+    )
+    client = weaviate.connect_to_local(host=host, port=port, grpc_port=grpc_port)
+    logger.info("Weaviate client object created.")
     return client
 
 
@@ -715,14 +723,18 @@ def delete_tenant(client, tenant_id: str) -> bool:
 
 
 # --- Semantic Search Function (Tenant Specific) ---
-def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
+def find_relevant_elements(
     client,
     tenant_ids: List[str],
     query_text: str,
     element_class="CodeElement",
-    limit=5,
-    distance=0.7,
+    limit=None,
+    distance=None,
 ):
+    if limit is None:
+        limit = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "5"))
+    if distance is None:
+        distance = float(os.getenv("SEMANTIC_SEARCH_DISTANCE", "0.7"))
     """Finds relevant elements using vector search based on query text across multiple tenants."""
     logger.info(
         f"Starting find_relevant_elements across tenants {tenant_ids} for query: '{query_text}', class='{element_class}', limit={limit}, distance={distance}"

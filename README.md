@@ -37,31 +37,17 @@ Then connect via any MCP client and call `scan_codebase` with a project path.
 Create a `.env` file in the project root (it is gitignored):
 
 ```dotenv
-# --- LLM Provider ---
-LLM_PROVIDER=gemini              # "gemini" (default) or "openai"
-LLM_API_KEY=sk-...               # generic — works for any provider
+LLM_PROVIDER=gemini
+LLM_API_KEY=
+GENERATE_LLM_DESCRIPTIONS=true
 
-# Or use provider-specific keys (alternative to LLM_API_KEY):
-# GEMINI_API_KEY=...
-# OPENAI_API_KEY=...
-
-# --- LLM Features ---
-GENERATE_LLM_DESCRIPTIONS=true   # enables enrichment, refinement, RAG
-# LLM_CONCURRENCY=5               # max concurrent LLM tasks
-
-# --- Model selection (optional) ---
-# Gemini: GENERATION_MODEL_NAME="models/gemini-2.0-flash-001"
-# OpenAI:  GENERATION_MODEL_NAME="gpt-4o"
-# Gemini:  EMBEDDING_MODEL_NAME="models/embedding-001"
-# OpenAI:  EMBEDDING_MODEL_NAME="text-embedding-3-small"
-
-# --- Weaviate (optional) ---
+# --- Advanced (defaults shown — uncomment to override) ---
+# LLM_CONCURRENCY=5
+# GENERATION_MODEL_NAME=models/gemini-2.0-flash-001
+# EMBEDDING_MODEL_NAME=models/embedding-001
 # WEAVIATE_HOST=localhost
 # WEAVIATE_PORT=8080
 # WEAVIATE_GRPC_PORT=50051
-
-# --- Advanced ---
-# WEAVIATE_BATCH_SIZE=100
 # SEMANTIC_SEARCH_LIMIT=5
 # SEMANTIC_SEARCH_DISTANCE=0.7
 # WATCHER_POLLING_INTERVAL=5
