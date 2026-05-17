@@ -4,7 +4,7 @@ import datetime
 import asyncio
 import re
 from dotenv import load_dotenv
-from weaviate_client import (  # Use relative import
+from .weaviate_client import (
     get_all_code_files,
     delete_elements_by_file_path,
     delete_code_file,
@@ -481,7 +481,7 @@ async def enrich_element(client, tenant_id: str, element_uuid: str) -> bool:
     and updates it in Weaviate. Runs LLM calls in a thread.
     Returns True on success/no action needed, False on failure.
     """
-    from llm import get_llm_provider, LLMProviderError
+    from .llm import get_llm_provider, LLMProviderError
 
     if not GENERATE_LLM_DESCRIPTIONS:
         logger.debug(

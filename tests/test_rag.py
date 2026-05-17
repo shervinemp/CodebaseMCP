@@ -4,8 +4,6 @@ import sys
 import os
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SRC_PACKAGE = os.path.join(PROJECT_ROOT, "src", "code_analysis_mcp")
-sys.path.insert(0, SRC_PACKAGE)
 sys.path.insert(0, PROJECT_ROOT)
 
 try:
@@ -41,7 +39,7 @@ def create_mock_provider(return_text="Generated response."):
 # --- Tests for answer_codebase_question ---
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.create_weaviate_client")
 @patch("src.code_analysis_mcp.rag.find_relevant_elements")
 @pytest.mark.asyncio
@@ -82,7 +80,7 @@ async def test_rag_answer_generation_success(
     mock_get_provider.assert_called_once()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.create_weaviate_client")
 @patch("src.code_analysis_mcp.rag.find_relevant_elements")
 @pytest.mark.asyncio
@@ -110,7 +108,7 @@ async def test_rag_no_context_found(
     mock_get_provider.assert_called_once()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.create_weaviate_client")
 @patch("src.code_analysis_mcp.rag.find_relevant_elements")
 @pytest.mark.asyncio
@@ -118,7 +116,7 @@ async def test_rag_llm_generation_error(
     mock_find_elements, mock_create_client, mock_get_provider
 ):
     """Tests error handling during LLM generation."""
-    from llm import LLMProviderError
+    from src.code_analysis_mcp.llm import LLMProviderError
 
     mock_provider = create_mock_provider()
     mock_provider.generate.side_effect = LLMProviderError("LLM API Failed")
@@ -144,7 +142,7 @@ async def test_rag_llm_generation_error(
     mock_find_elements.assert_called_once()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.create_weaviate_client")
 @pytest.mark.asyncio
 async def test_rag_tenant_not_provided(mock_create_client, mock_get_provider):
@@ -160,7 +158,7 @@ async def test_rag_tenant_not_provided(mock_create_client, mock_get_provider):
     assert "ERROR: tenant_id must be provided" in answer
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.create_weaviate_client")
 @pytest.mark.asyncio
 async def test_rag_tenant_does_not_exist(mock_create_client, mock_get_provider):
@@ -184,7 +182,7 @@ async def test_rag_tenant_does_not_exist(mock_create_client, mock_get_provider):
 # --- Tests for refine_element_description ---
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @patch("src.code_analysis_mcp.rag.get_element_details")
 @patch("src.code_analysis_mcp.rag.update_element_properties")
 @patch("src.code_analysis_mcp.rag.find_element_by_name")
@@ -252,7 +250,7 @@ async def test_refine_success(
 # --- Tests for generate_codebase_summary ---
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @pytest.mark.asyncio
 async def test_generate_summary_success(mock_get_provider):
     """Tests successful project summary generation."""
@@ -300,7 +298,7 @@ async def test_generate_summary_success(mock_get_provider):
     mock_query.fetch_objects.assert_called_once()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @pytest.mark.asyncio
 async def test_generate_summary_tenant_not_found(mock_get_provider):
     """Tests summary generation when the tenant doesn't exist."""
@@ -319,7 +317,7 @@ async def test_generate_summary_tenant_not_found(mock_get_provider):
     mock_get_provider.return_value.generate.assert_not_called()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @pytest.mark.asyncio
 async def test_generate_summary_no_elements(mock_get_provider):
     """Tests summary generation when no key elements are found."""
@@ -346,11 +344,11 @@ async def test_generate_summary_no_elements(mock_get_provider):
     mock_get_provider.return_value.generate.assert_not_called()
 
 
-@patch("llm.get_llm_provider")
+@patch("src.code_analysis_mcp.llm.get_llm_provider")
 @pytest.mark.asyncio
 async def test_generate_summary_llm_error(mock_get_provider):
     """Tests summary generation when the LLM call fails."""
-    from llm import LLMProviderError
+    from src.code_analysis_mcp.llm import LLMProviderError
 
     mock_provider = create_mock_provider()
     mock_provider.generate.side_effect = LLMProviderError("LLM Down")

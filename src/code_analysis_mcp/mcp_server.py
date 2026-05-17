@@ -1,3 +1,17 @@
+"""MCP Server for Python Code Analysis."""
+from __future__ import annotations
+
+# --- Direct execution trampoline ---
+if __name__ == "__main__" and __package__ is None:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from code_analysis_mcp import mcp_server
+
+    mcp_server.main()
+    sys.exit(0)
+
 import asyncio
 import os
 import contextlib
@@ -24,11 +38,11 @@ from watchdog.events import (
     FileDeletedEvent,
 )
 
-from code_scanner import (
+from .code_scanner import (
     enrich_element,
     _scan_cleanup_and_upload,
 )
-from weaviate_client import (
+from .weaviate_client import (
     create_weaviate_client,
     create_schema,
     find_element_by_name,
@@ -42,7 +56,7 @@ from weaviate_client import (
     delete_codebase_registry_entry,
     delete_tenant,
 )
-from rag import (
+from .rag import (
     answer_codebase_question,
     refine_element_description,
     generate_codebase_summary,
@@ -73,7 +87,7 @@ LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "5"))
 WATCHER_POLLING_INTERVAL = int(os.getenv("WATCHER_POLLING_INTERVAL", "5"))
 
 if LLM_ENABLED:
-    from llm import init_llm_provider, get_llm_provider
+    from .llm import init_llm_provider, get_llm_provider
 
     init_llm_provider()
     provider = get_llm_provider()
@@ -552,7 +566,7 @@ logger.info("--- Attempting FastMCP instantiation ---")
 
 mcp = FastMCP(
     name="code-analysis-mcp",
-    description="MCP Server for Python Code Analysis using AST, Weaviate, and LLM (Gemini/OpenAI), with codebase management.",
+    instructions="MCP Server for Python Code Analysis using AST, Weaviate, and LLM (Gemini/OpenAI), with codebase management.",
     lifespan=lifespan,
 )
 logger.info("--- FastMCP instantiation successful ---")
@@ -1753,7 +1767,8 @@ async def remove_codebase_dependency(
 
 
 # --- Run the server ---
-if __name__ == "__main__":
+def main():
+    """Entry point for the MCP server."""
     logger.info("Attempting to start the MCP server with mcp.run()...")
     try:
         logger.info("Calling mcp.run()...")
@@ -1767,5 +1782,7 @@ if __name__ == "__main__":
         logger.exception(
             f"An error occurred while trying to run the MCP server: {run_e}"
         )
-    except Exception as main_e:
-        logger.exception(f"Error during mcp.run(): {main_e}")
+
+
+if __name__ == "__main__":
+    main()

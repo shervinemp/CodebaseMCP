@@ -729,7 +729,7 @@ def find_relevant_elements(  # Keep synchronous for now, RAG handles threading
     )
     all_results = []
     try:
-        from llm import get_llm_provider
+        from .llm import get_llm_provider
 
         provider = get_llm_provider()
         if not provider or not provider.is_available:

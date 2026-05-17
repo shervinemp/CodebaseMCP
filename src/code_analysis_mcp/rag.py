@@ -4,7 +4,7 @@ import asyncio
 import re
 import weaviate.classes.query as wvc_query
 
-from weaviate_client import (
+from .weaviate_client import (
     create_weaviate_client,
     find_relevant_elements,
     get_element_details,
@@ -31,7 +31,7 @@ async def answer_codebase_question(
     logger.info(f"Answering question: '{query_text}' for tenant '{tenant_id}'")
 
     # Ensure LLM models are available
-    from llm import get_llm_provider
+    from .llm import get_llm_provider
 
     provider = get_llm_provider()
     if not provider or not provider.is_available:
@@ -224,7 +224,7 @@ async def answer_codebase_question(
         # 5. Call generative LLM
         logger.debug("answer_codebase_question: Generating answer with LLM...")
         try:
-            from llm import LLMProviderError
+            from .llm import LLMProviderError
 
             answer = await asyncio.to_thread(provider.generate, prompt)
             logger.info("answer_codebase_question: LLM generation successful.")
@@ -265,7 +265,7 @@ async def refine_element_description(client, tenant_id: str, element_uuid: str) 
         f"Refining description for element UUID: {element_uuid} in tenant '{tenant_id}'"
     )
 
-    from llm import get_llm_provider, LLMProviderError, RateLimitError
+    from .llm import get_llm_provider, LLMProviderError, RateLimitError
 
     provider = get_llm_provider()
     if not provider or not provider.is_available:
@@ -552,7 +552,7 @@ async def generate_codebase_summary(client, codebase_name: str) -> str:
     """
     logger.info(f"Generating summary for codebase (tenant): '{codebase_name}'")
 
-    from llm import get_llm_provider, LLMProviderError
+    from .llm import get_llm_provider, LLMProviderError
 
     provider = get_llm_provider()
     if not provider or not provider.is_available:
