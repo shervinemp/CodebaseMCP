@@ -89,6 +89,7 @@ logger.info("Environment variables loaded for MCP server.")
 LLM_ENABLED = os.getenv("GENERATE_LLM_DESCRIPTIONS", "false").lower() == "true"
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "5"))
 WATCHER_POLLING_INTERVAL = int(os.getenv("WATCHER_POLLING_INTERVAL", "5"))
+WATCHER_DEBOUNCE_PERIOD = float(os.getenv("WATCHER_DEBOUNCE_PERIOD", "60"))
 
 if LLM_ENABLED:
     from .llm import init_llm_provider, get_llm_provider
@@ -117,13 +118,22 @@ ACTIVE_WATCHERS: Dict[str, Dict[str, Any]] = {}
 
 
 class AnalysisTriggerHandler(FileSystemEventHandler):
-    """Triggers analysis when a watched file is modified or created."""
+    """Triggers analysis when a watched file is modified or created.
+
+    Uses a coalescing debounce: events are queued and processing is deferred
+    until WATCHER_DEBOUNCE_PERIOD seconds of inactivity. Processing also
+    fires immediately when an MCP query tool flushes pending work.
+    """
 
     def __init__(self, client, codebase_name: str, patterns: list[str]):
         self.client = client
         self.codebase_name = codebase_name
         self.patterns = patterns
-        self.last_event_time = {}
+        self.pending_paths: dict[str, str] = {}
+        self.last_event_time: float = 0.0
+        self._debounce_timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._debounce_period = WATCHER_DEBOUNCE_PERIOD
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -163,63 +173,145 @@ class AnalysisTriggerHandler(FileSystemEventHandler):
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-    def process(self, event):
-        """Process file system event: Scan, Upload, and enrich for the specific codebase."""
-        if event.is_directory or not self._should_process(event.src_path):
-            return
-
-        event_type = event.event_type
-        path = event.src_path
-        debounce_period = 2.0
-        current_time = time.time()
-
-        last_time = self.last_event_time.get(path, 0)
-        if current_time - last_time < debounce_period:
-            logger.debug(f"Debouncing {event_type} event for: {path}")
-            return
-
-        self.last_event_time[path] = current_time
-        logger.info(
-            f"Watcher: Detected {event_type} for {path} in codebase '{self.codebase_name}'. Triggering update."
+    def _restart_timer(self):
+        """Cancel existing timer and start a new one."""
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
+        self._debounce_timer = threading.Timer(
+            self._debounce_period, self._process_pending_sync
         )
+        self._debounce_timer.daemon = True
+        self._debounce_timer.start()
 
+    def _execute_scan_sync(self):
+        """Run the full-directory scan (sync, called from timer/worker thread)."""
+        codebase_details = get_codebase_details(self.client, self.codebase_name)
+        if codebase_details and codebase_details.get("directory"):
+            codebase_dir = codebase_details["directory"]
+            result = self._run_async_task(
+                _scan_cleanup_and_upload(
+                    self.client, codebase_dir, tenant_id=self.codebase_name
+                )
+            )
+            if result and LLM_ENABLED:
+                _, processed_uuids = result
+                if processed_uuids:
+                    logger.info(
+                        f"Watcher: Scheduling LLM enrichment for {len(processed_uuids)} elements in '{self.codebase_name}'"
+                    )
+                    self._fire_and_forget(
+                        self._dag_sort_and_enrich(processed_uuids)
+                    )
+        else:
+            logger.error(
+                f"Watcher: Could not get codebase directory for '{self.codebase_name}' to trigger scan."
+            )
+
+    def _process_pending_sync(self):
+        """Process all queued events (called by debounce timer)."""
+        with self._lock:
+            if not self.pending_paths:
+                return
+            paths = dict(self.pending_paths)
+            self.pending_paths.clear()
+            self.last_event_time = 0.0
+            self._debounce_timer = None
+
+        logger.info(
+            f"Watcher: Debounce fired — processing {len(paths)} pending change(s) for '{self.codebase_name}'"
+        )
         try:
-            if event_type == "deleted":
+            deleted_paths = [p for p, t in paths.items() if t == "deleted"]
+            changed_paths = [p for p, t in paths.items() if t != "deleted"]
+
+            if deleted_paths:
                 logger.info(
-                    f"Watcher: Deleting data for {path} in tenant '{self.codebase_name}'"
+                    f"Watcher: Deleting data for {len(deleted_paths)} file(s) in tenant '{self.codebase_name}'"
                 )
-                delete_elements_by_file_path(self.client, self.codebase_name, path)
-                delete_code_file(self.client, self.codebase_name, path)
-            else:
-                logger.info(
-                    f"Watcher: Running scan for {path} in tenant '{self.codebase_name}'"
-                )
+                for p in deleted_paths:
+                    delete_elements_by_file_path(self.client, self.codebase_name, p)
+                    delete_code_file(self.client, self.codebase_name, p)
+
+            if changed_paths:
+                self._execute_scan_sync()
+
+        except Exception as e:
+            logger.error(
+                f"Watcher: Error processing pending changes for '{self.codebase_name}': {e}"
+            )
+
+    async def flush(self) -> bool:
+        """Flush all pending work immediately.
+
+        Called from an async MCP tool context. Returns True if work was flushed.
+        """
+        with self._lock:
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+            if not self.pending_paths:
+                return False
+            paths = dict(self.pending_paths)
+            self.pending_paths.clear()
+            self.last_event_time = 0.0
+
+        logger.info(
+            f"Watcher: Flushing {len(paths)} pending change(s) for '{self.codebase_name}' (MCP-triggered)"
+        )
+        try:
+            deleted_paths = [p for p, t in paths.items() if t == "deleted"]
+            changed_paths = [p for p, t in paths.items() if t != "deleted"]
+
+            if deleted_paths:
+                for p in deleted_paths:
+                    delete_elements_by_file_path(self.client, self.codebase_name, p)
+                    delete_code_file(self.client, self.codebase_name, p)
+
+            if changed_paths:
                 codebase_details = get_codebase_details(self.client, self.codebase_name)
                 if codebase_details and codebase_details.get("directory"):
                     codebase_dir = codebase_details["directory"]
-                    result = self._run_async_task(
-                        _scan_cleanup_and_upload(
-                            self.client, codebase_dir, tenant_id=self.codebase_name
-                        )
+                    result = await _scan_cleanup_and_upload(
+                        self.client, codebase_dir, tenant_id=self.codebase_name
                     )
                     if result and LLM_ENABLED:
                         _, processed_uuids = result
                         if processed_uuids:
-                            logger.info(
-                                f"Watcher: Scheduling LLM enrichment for {len(processed_uuids)} elements in '{self.codebase_name}'"
-                            )
-                            self._fire_and_forget(
+                            enrich_task = asyncio.create_task(
                                 self._dag_sort_and_enrich(processed_uuids)
+                            )
+                            background_llm_tasks.add(enrich_task)
+                            enrich_task.add_done_callback(
+                                background_llm_tasks.discard
                             )
                 else:
                     logger.error(
-                        f"Watcher: Could not get codebase directory for '{self.codebase_name}' to trigger scan."
+                        f"Watcher: Could not get codebase directory for '{self.codebase_name}' to flush scan."
                     )
-
         except Exception as e:
             logger.error(
-                f"Watcher: Error processing event for {path} in codebase '{self.codebase_name}': {e}"
+                f"Watcher: Error flushing pending changes for '{self.codebase_name}': {e}"
             )
+            return False
+        return True
+
+    def process(self, event):
+        """Queue a file system event for debounced processing."""
+        if event.is_directory or not self._should_process(event.src_path):
+            return
+        path = event.src_path
+        event_type = event.event_type
+
+        with self._lock:
+            self.pending_paths[path] = event_type
+            self.last_event_time = time.time()
+            pending_count = len(self.pending_paths)
+            self._restart_timer()
+
+        logger.info(
+            f"Watcher: Queued {event_type} for {path} in '{self.codebase_name}' "
+            f"(pending: {pending_count}). Debounce timer reset ({self._debounce_period}s)."
+        )
 
     async def _dag_sort_and_enrich(self, uuids: list[str]):
         """DAG-sort UUIDs then enrich in topological order."""
@@ -258,6 +350,8 @@ def watcher_thread_target(
         codebase_name=codebase_name,
         patterns=patterns,
     )
+    # Register handler so MCP tools can flush pending work
+    ACTIVE_WATCHERS[codebase_name]["handler"] = event_handler
     observer = Observer()
     observer.schedule(event_handler, directory, recursive=True)
     observer.start()
@@ -290,6 +384,10 @@ def watcher_thread_target(
     except Exception as e:
         logger.error(f"Watcher thread for '{codebase_name}' encountered an error: {e}")
     finally:
+        # Cancel any pending debounce timer
+        if event_handler._debounce_timer:
+            event_handler._debounce_timer.cancel()
+            event_handler._debounce_timer = None
         logger.info(f"Watcher thread for '{codebase_name}': Stopping observer...")
         observer.stop()
         observer.join()
@@ -348,13 +446,14 @@ def start_watcher(codebase_name: str) -> tuple[bool, str]:
             args=(codebase_name, directory, stop_event),
             daemon=True,
         )
-        thread.start()
 
         ACTIVE_WATCHERS[codebase_name] = {
             "thread": thread,
             "stop_event": stop_event,
             "directory": directory,
+            "handler": None,
         }
+        thread.start()
         msg = f"File watcher started successfully for codebase '{codebase_name}' on directory '{directory}'."
         logger.info(msg)
         return True, msg
@@ -416,6 +515,24 @@ def stop_watcher(codebase_name: str) -> tuple[bool, str]:
         msg = f"No active watcher found for codebase '{codebase_name}' in this server instance. Registry status set to inactive."
         logger.info(msg)
         return True, msg
+
+
+async def flush_active_watcher() -> bool:
+    """Flush pending watcher work for the active codebase immediately.
+
+    Called before MCP query tools so that any file changes queued by the
+    debounced watcher are processed before the query executes.
+    Returns True if work was flushed.
+    """
+    if not ACTIVE_CODEBASE_NAME:
+        return False
+    watcher_info = ACTIVE_WATCHERS.get(ACTIVE_CODEBASE_NAME)
+    if not watcher_info:
+        return False
+    handler: AnalysisTriggerHandler | None = watcher_info.get("handler")
+    if not handler:
+        return False
+    return await handler.flush()
 
 
 # --- Lifespan Management ---
@@ -1172,6 +1289,8 @@ async def find_element(
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
 
+    await flush_active_watcher()
+
     client = global_weaviate_client
     if not client or not client.is_connected():
         return {"status": "error", "message": "Weaviate client not connected."}
@@ -1317,6 +1436,8 @@ async def get_details(
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
 
+    await flush_active_watcher()
+
     client = global_weaviate_client
     if not client or not client.is_connected():
         return {"status": "error", "message": "Weaviate client not connected."}
@@ -1380,6 +1501,8 @@ async def analyze_snippet(
             "status": "error",
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
+
+    await flush_active_watcher()
 
     client = global_weaviate_client
     if not client or not client.is_connected():
@@ -1473,6 +1596,8 @@ async def ask_question(
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
 
+    await flush_active_watcher()
+
     client = global_weaviate_client
 
     tenant_id = ACTIVE_CODEBASE_NAME
@@ -1508,6 +1633,8 @@ async def regenerate_summary():
             "status": "error",
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
+    await flush_active_watcher()
+
     if not LLM_ENABLED:
         return {"status": "error", "message": "LLM processing is disabled."}
 
@@ -1559,6 +1686,8 @@ async def trigger_llm_processing(
             "status": "error",
             "message": "No active codebase selected. Use 'select_codebase' first.",
         }
+    await flush_active_watcher()
+
     if not LLM_ENABLED:
         return {"status": "error", "message": "LLM processing is disabled."}
 
